@@ -78,11 +78,20 @@ class Glyph:
             nodeTypes = [op for op, arg in contour.value]
             self.nodeTypes.append(nodeTypes)
 
+            stats_contour = contour
             greenStats = StatisticsPen(glyphset=glyphset)
             controlStats = StatisticsControlPen(glyphset=glyphset)
             try:
-                contour.replay(greenStats)
-                contour.replay(controlStats)
+                if nodeTypes[0] == "addComponent":
+                    # Decompose the component outline once and reuse the
+                    # expanded recording for both statistics pens, instead of
+                    # letting each pen expand (and draw) every component again.
+                    stats_contour = DecomposingRecordingPen(
+                        glyphset, skipMissingComponents=True
+                    )
+                    contour.replay(stats_contour)
+                stats_contour.replay(greenStats)
+                stats_contour.replay(controlStats)
                 self.openContours.append(False)
             except OpenContourError as e:
                 self.openContours.append(True)
