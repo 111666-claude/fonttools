@@ -203,6 +203,17 @@ These options control how additional glyphs are added to the subset.
   Do not add glyphs 0, 1, 2, and 3 to the subset, unless specified in
   glyph set. [default]
 
+--retain-all-variation-sequences
+  Keep all Unicode variation sequences for the retained base characters,
+  without having to explicitly list every variation selector. For each
+  requested base character, every 'cmap' format 14 record referencing it
+  is preserved, including default and non-default (glyph-mapped) sequences,
+  with both BMP (U+FE00..U+FE0F) and supplementary (U+E0100..U+E01EF)
+  selectors, and the glyphs used by non-default sequences are closed over.
+
+--no-retain-all-variation-sequences
+  Require each variation selector to be requested explicitly. [default]
+
 --no-layout-closure
   Do not expand glyph set to add glyphs produced by OpenType layout
   features.  Instead, OpenType layout features will be subset to only
@@ -3063,7 +3074,10 @@ def closure_glyphs(self, s):
     for table in tables:
         if table.format == 14:
             for varSelector, cmap in table.uvsDict.items():
-                if varSelector not in s.unicodes_requested:
+                if (
+                    not s.options.retain_all_variation_sequences
+                    and varSelector not in s.unicodes_requested
+                ):
                     continue
                 glyphs = {g for u, g in cmap if u in s.unicodes_requested}
                 if None in glyphs:
@@ -3112,14 +3126,21 @@ def subset_glyphs(self, s):
             # TODO(behdad) We drop all the default-UVS mappings
             # for glyphs_requested.  So it's the caller's responsibility to make
             # sure those are included.
+            # A non-default mapping naming a glyph that did not survive closure
+            # (e.g. a missing glyph) can't be compiled later; drop such dangling
+            # references so saving and re-opening stays stable.  For any glyph
+            # that exists and matches the predicate below, it is part of
+            # glyphs_retained, so this extra test only removes dangling entries.
+            retained_glyphs = getattr(s, "glyphs_retained", None)
             t.uvsDict = {
                 v: [
                     (u, g)
                     for u, g in l
-                    if g in s.glyphs_requested or u in s.unicodes_requested
+                    if (retained_glyphs is None or g is None or g in retained_glyphs)
+                    and (g in s.glyphs_requested or u in s.unicodes_requested)
                 ]
                 for v, l in t.uvsDict.items()
-                if v in s.unicodes_requested
+                if s.options.retain_all_variation_sequences or v in s.unicodes_requested
             }
             t.uvsDict = {v: l for v, l in t.uvsDict.items() if l}
         elif t.isUnicode():
@@ -3438,6 +3459,7 @@ class Options(object):
         self.name_languages = [0x0409]  # English
         self.obfuscate_names = False  # to make webfont unusable as a system font
         self.retain_gids = False
+        self.retain_all_variation_sequences = False
         self.notdef_glyph = True  # gid0 for TrueType / .notdef for CFF
         self.notdef_outline = False  # No need for notdef to have an outline really
         self.recommended_glyphs = False  # gid1, gid2, gid3 for TrueType
