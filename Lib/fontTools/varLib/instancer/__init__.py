@@ -102,7 +102,12 @@ from fontTools.misc.fixedTools import (
     strToFixedToFloat,
     otRound,
 )
-from fontTools.varLib.models import normalizeValue, piecewiseLinearMap, VariationModel
+from fontTools.varLib.models import (
+    normalizeValue,
+    piecewiseLinearMap,
+    supportScalar,
+    VariationModel,
+)
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables.TupleVariation import TupleVariation
 from fontTools.ttLib.tables import _g_l_y_f
@@ -603,6 +608,22 @@ def instantiateTupleVariationStore(
         List[float]: the overall delta adjustment after applicable deltas were summed.
     """
 
+    # Fast path for full instances (all axes pinned). Instead of rebasing each
+    # variation tuple once per axis -- which allocates a fresh TupleVariation
+    # (and a full copy of its coordinate list) and rescales its deltas on every
+    # step -- compute each tuple's scalar directly at the pinned location and
+    # accumulate its (inferred) deltas into a single result list.
+    # axisLimits only contains the axes requested by the caller, so "fully
+    # pinned" means every axis actually participated in by the tuples is pinned;
+    # any tuple still varying on another axis must go through the general path.
+    pinnedLocation = axisLimits.pinnedLocation()
+    if pinnedLocation and all(
+        set(var.axes).issubset(pinnedLocation) for var in variations
+    ):
+        return _instantiatePinnedTupleVariations(
+            variations, pinnedLocation, origCoords, endPts
+        )
+
     newVariations = changeTupleVariationsAxisLimits(variations, axisLimits)
 
     mergedVariations = collections.OrderedDict()
@@ -627,6 +648,116 @@ def instantiateTupleVariationStore(
     variations[:] = list(mergedVariations.values())
 
     return defaultVar.coordinates if defaultVar is not None else []
+
+
+def _instantiatePinnedTupleVariations(variations, location, origCoords, endPts):
+    """Apply fully-pinned tuple variations in place, returning default deltas.
+
+    Equivalent to the general rebasing pipeline when every axis is pinned, but
+    avoids the per-axis TupleVariation allocations and repeated delta rescales:
+    the support scalar of each tuple at ``location`` is computed once, its
+    deltas are inferred (gvar only) and scaled as they are accumulated into a
+    single result list, and the input variation store is emptied.
+    """
+    if origCoords is not None:
+        return _instantiatePinnedGvarTupleVariations(
+            variations, location, origCoords, endPts
+        )
+    return _instantiatePinnedCvarTupleVariations(variations, location)
+
+
+def _instantiatePinnedGvarTupleVariations(variations, location, origCoords, endPts):
+    from fontTools.varLib.iup import iup_delta
+
+    # iup_delta() reads outline coordinates point by point; going through
+    # GlyphCoordinates.__getitem__ rebuilds an (x, y) tuple and runs
+    # float.is_integer() on every access. Materialize the plain tuple list once
+    # per glyph instead, so each tuple's IUP inference only pays indexing.
+    if isinstance(origCoords, _g_l_y_f.GlyphCoordinates):
+        inferCoords = list(origCoords)
+    else:
+        inferCoords = origCoords
+
+    accumulated = None
+
+    for var in variations:
+        # supportScalar() returns 0.0 outside the tuple's support, matching the
+        # tuples that the rebasing pipeline drops for having no influence.
+        scalar = supportScalar(location, var.axes)
+        if scalar == 0.0:
+            continue
+
+        coordinates = var.coordinates
+        if None in coordinates:
+            # IUP inference before scaling, as in the general pipeline
+            if len(coordinates) != len(inferCoords):
+                raise ValueError(
+                    "Expected len(origCoords) == %d; found %d"
+                    % (len(coordinates), len(inferCoords))
+                )
+            coordinates = iup_delta(coordinates, inferCoords, endPts)
+        elif accumulated is not None and len(coordinates) != len(accumulated):
+            # Match TupleVariation.__iadd__ in the general pipeline.
+            raise ValueError("cannot sum TupleVariation deltas with different lengths")
+
+        if accumulated is None:
+            if scalar == 1.0:
+                accumulated = list(coordinates)
+            else:
+                accumulated = [(d[0] * scalar, d[1] * scalar) for d in coordinates]
+        else:
+            if scalar == 1.0:
+                for i, d in enumerate(coordinates):
+                    a = accumulated[i]
+                    accumulated[i] = (a[0] + d[0], a[1] + d[1])
+            else:
+                for i, d in enumerate(coordinates):
+                    a = accumulated[i]
+                    accumulated[i] = (
+                        a[0] + d[0] * scalar,
+                        a[1] + d[1] * scalar,
+                    )
+
+    # A full instance leaves no residual variations.
+    variations.clear()
+
+    return accumulated if accumulated is not None else []
+
+
+def _instantiatePinnedCvarTupleVariations(variations, location):
+    accumulated = None
+
+    for var in variations:
+        scalar = supportScalar(location, var.axes)
+        if scalar == 0.0:
+            continue
+
+        coordinates = var.coordinates
+        if accumulated is not None and len(coordinates) != len(accumulated):
+            # Match the error raised by TupleVariation.__iadd__ in the general
+            # pipeline when two delta stores of different lengths are merged.
+            raise ValueError("cannot sum TupleVariation deltas with different lengths")
+
+        if scalar == 1.0:
+            scaled = coordinates
+        else:
+            scaled = [None if d is None else d * scalar for d in coordinates]
+
+        if accumulated is None:
+            accumulated = list(coordinates) if scaled is coordinates else scaled
+        else:
+            # 'None' in cvar deltas means "no adjustment" (treated as zero)
+            for i, d in enumerate(scaled):
+                if d is None:
+                    continue
+                if accumulated[i] is None:
+                    accumulated[i] = d
+                else:
+                    accumulated[i] += d
+
+    variations.clear()
+
+    return accumulated if accumulated is not None else []
 
 
 def changeTupleVariationsAxisLimits(variations, axisLimits):

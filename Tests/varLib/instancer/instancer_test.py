@@ -410,6 +410,164 @@ class InstantiateCvarTest(object):
         assert "cvar" not in varfont
 
 
+class PinnedTupleVariationFastPathTest(object):
+    """The full-instance fast path must match the general rebasing pipeline
+    without allocating intermediate TupleVariation objects or rescaling
+    per-tuple coordinate lists."""
+
+    @staticmethod
+    def _limits(**pins):
+        return instancer.NormalizedAxisLimits(
+            {
+                tag: instancer.NormalizedAxisTripleAndDistances(v, v, v)
+                for tag, v in pins.items()
+            }
+        )
+
+    def test_gvar_no_intermediate_tuple_or_rescale(self):
+        from unittest import mock
+
+        origCoords = _g_l_y_f.GlyphCoordinates(
+            [(float(i), float(i + 1)) for i in range(8)]
+        )
+        endPts = [3]
+        variations = [
+            TupleVariation(
+                {"wght": (0.0, 0.5, 1.0)},
+                [(0.5 * i, 0.25 * i) for i in range(8)],
+            ),
+            TupleVariation(
+                {"wdth": (-1.0, -0.5, 0.0)},
+                [None if i % 2 else (1.5 * i, -0.75 * i) for i in range(8)],
+            ),
+        ]
+
+        # The fast path must neither construct TupleVariation objects nor
+        # rescale delta lists; spy on both without altering their behavior.
+        with (
+            mock.patch.object(
+                TupleVariation,
+                "__init__",
+                autospec=True,
+                side_effect=TupleVariation.__init__,
+            ) as init_spy,
+            mock.patch.object(
+                TupleVariation, "scaleDeltas", autospec=True
+            ) as scale_spy,
+        ):
+            deltas = instancer.instantiateTupleVariationStore(
+                variations,
+                self._limits(wght=0.3, wdth=-0.7),
+                origCoords,
+                endPts,
+            )
+
+        assert init_spy.call_count == 0
+        assert scale_spy.call_count == 0
+        # fully pinned: the variation store is emptied
+        assert variations == []
+        assert len(deltas) == 8
+        assert all(isinstance(d, tuple) and len(d) == 2 for d in deltas)
+
+    def test_gvar_fractional_scalars_and_zero_impact(self):
+        # pin values sit between tent peaks, so scalars are fractional rather
+        # than 0/1; the third tuple lies completely outside its support.
+        origCoords = _g_l_y_f.GlyphCoordinates(
+            [(float(i) * 1.25, float(i) + 0.5) for i in range(8)]
+        )
+        endPts = [3]
+        variations = [
+            TupleVariation(
+                {"wght": (0.0, 0.5, 1.0)},
+                [(0.5 * i + 0.25, -0.25 * i + 0.75) for i in range(8)],
+            ),
+            TupleVariation(
+                {"wdth": (-1.0, -0.5, 0.0)},
+                [None if i % 3 else (10.5 - i, -20.25 + i) for i in range(8)],
+            ),
+            # zero influence at this pin (pin 0.3 is below the tent's lower 0.9)
+            TupleVariation(
+                {"wght": (0.9, 0.95, 1.0)},
+                [(100.0, 100.0) for _ in range(8)],
+            ),
+        ]
+
+        deltas = instancer.instantiateTupleVariationStore(
+            variations, self._limits(wght=0.3, wdth=-0.7), origCoords, endPts
+        )
+
+        # wght tent (0,0.5,1) at pin 0.3 -> scalar 0.6
+        # wdth tent (-1,-0.5,0) at pin -0.7 -> scalar 0.6
+        dense_x0 = (0.5 * 0 + 0.25) * 0.6
+        dense_y0 = (-0.25 * 0 + 0.75) * 0.6
+        # point 0 carries both the dense wght delta and an explicit sparse
+        # wdth delta (10.5, -20.25); the sparse tuple is dense at point 0.
+        assert deltas[0] == pytest.approx(
+            (dense_x0 + 10.5 * 0.6, dense_y0 + -20.25 * 0.6)
+        )
+        # point 1 only has the dense delta; its wdth delta is IUP-inferred,
+        # so the result must be a concrete (x, y) tuple rather than None
+        assert deltas[1] is not None
+        assert all(d is not None for d in deltas)
+        # the zero-influence tuple contributed nothing
+        assert all(abs(x) < 50 and abs(y) < 50 for x, y in deltas)
+
+    def test_gvar_length_mismatch_raises(self):
+        # sparse tuple with a length different from the outline
+        var = TupleVariation(
+            {"wght": (0.0, 0.5, 1.0)},
+            [None, (1.0, 2.0), None, (3.0, 4.0)],
+        )
+        origCoords = _g_l_y_f.GlyphCoordinates([(0.0, 0.0), (1.0, 1.0)])
+        with pytest.raises(ValueError, match="Expected len"):
+            instancer.instantiateTupleVariationStore(
+                [var], self._limits(wght=0.3), origCoords, [1]
+            )
+
+    def test_gvar_dense_length_mismatch_raises(self):
+        origCoords = _g_l_y_f.GlyphCoordinates([(float(i), float(i)) for i in range(4)])
+        v1 = TupleVariation({"wght": (0.0, 0.5, 1.0)}, [(1.0, 1.0)] * 4)
+        v2 = TupleVariation({"wght": (0.0, 1.0, 1.0)}, [(2.0, 2.0)] * 3)
+        with pytest.raises(ValueError, match="different lengths"):
+            instancer.instantiateTupleVariationStore(
+                [v1, v2], self._limits(wght=0.3), origCoords, [3]
+            )
+
+    def test_cvar_none_treated_as_zero(self):
+        variations = [
+            TupleVariation({"wght": (0.0, 0.5, 1.0)}, [1.5, None, 3.0, None]),
+            TupleVariation({"wdth": (-1.0, -0.5, 0.0)}, [None, 2.25, None, -1.125]),
+        ]
+        deltas = instancer.instantiateTupleVariationStore(
+            variations, self._limits(wght=0.3, wdth=-0.7)
+        )
+        assert variations == []
+        # wght tent (0,0.5,1) at pin 0.3 -> scalar 0.6
+        # wdth tent (-1,-0.5,0) at pin -0.7 -> scalar 0.6
+        assert deltas[0] == pytest.approx(1.5 * 0.6)
+        assert deltas[1] == pytest.approx(2.25 * 0.6)
+        assert deltas[2] == pytest.approx(3.0 * 0.6)
+        assert deltas[3] == pytest.approx(-1.125 * 0.6)
+
+    def test_cvar_length_mismatch_raises(self):
+        v1 = TupleVariation({"wght": (0.0, 0.5, 1.0)}, [1.0, 2.0, 3.0])
+        v2 = TupleVariation({"wght": (0.0, 1.0, 1.0)}, [4.0, 5.0])
+        with pytest.raises(ValueError, match="different lengths"):
+            instancer.instantiateTupleVariationStore([v1, v2], self._limits(wght=0.3))
+
+    def test_partial_pin_uses_general_pipeline(self):
+        # tuple varies on an axis not present in axisLimits: not a full pin
+        origCoords = _g_l_y_f.GlyphCoordinates([(float(i), float(i)) for i in range(3)])
+        var = TupleVariation({"wdth": (0.0, 0.5, 1.0)}, [(1.0, 1.0)] * 3)
+        store = [var]
+        deltas = instancer.instantiateTupleVariationStore(
+            store, self._limits(wght=0.3), origCoords, [2]
+        )
+        assert deltas == []
+        assert len(store) == 1
+        assert "wdth" in store[0].axes
+
+
 class InstantiateMVARTest(object):
     @pytest.mark.parametrize(
         "location, expected",
