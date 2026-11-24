@@ -296,7 +296,21 @@ class _TTGlyphCFF(_TTGlyph):
         """Draw the glyph onto ``pen``. See fontTools.pens.basePen for details
         how that works.
         """
-        self.glyphSet.charStrings[self.name].draw(pen, self.glyphSet.blender)
+        try:
+            self.glyphSet.charStrings[self.name].draw(pen, self.glyphSet.blender)
+        except Exception as e:
+            # Keep the original exception type but identify the offending
+            # glyph, which is essential for diagnosing malformed CFF2
+            # blend/vsindex/Private DICT data. Use a marker rather than a
+            # substring test, since a short glyph name (e.g. "I" or "A") can
+            # coincidentally appear inside the underlying message.
+            if getattr(e, "_fonttoolsCFFGlyph", None) is None:
+                try:
+                    e.args = ("CFF2 glyph %r: %s" % (self.name, e),) + tuple(e.args[1:])
+                    e._fonttoolsCFFGlyph = self.name
+                except Exception:
+                    pass
+            raise
 
 
 def _evaluateCondition(condition, axes, location, instancer):

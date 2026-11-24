@@ -45,6 +45,28 @@ maxStackLimit = 513
 # maxstack operator has been deprecated. max stack is now always 513.
 
 
+def annotateException(exc, context):
+    """Prepend ``context`` to an exception's message without changing its type.
+
+    This keeps ``except SpecificError`` working while ensuring the rendered
+    error identifies the glyph or CFF structure (e.g. a CharString name) that
+    triggered it.
+    """
+    text = str(exc)
+    if context and context not in text:
+        try:
+            if text:
+                newArgs = ("%s: %s" % (context, text),) + tuple(exc.args[1:])
+            else:
+                newArgs = (context,) + tuple(exc.args[1:])
+            exc.args = newArgs
+        except Exception:
+            # Some exception subclasses do not allow reassigning args; the
+            # original exception will simply be re-raised without context.
+            pass
+    return exc
+
+
 class CFFFontSet(object):
     """A CFF font "file" can contain more than one font, although this is
     extremely rare (and not allowed within OpenType fonts).
@@ -278,11 +300,21 @@ class CFFFontSet(object):
                 name, attrs, content = element
                 topDict.fromXML(name, attrs, content)
 
-            if hasattr(topDict, "VarStore") and topDict.FDArray[0].vstore is None:
-                fdArray = topDict.FDArray
-                for fontDict in fdArray:
-                    if hasattr(fontDict, "Private"):
-                        fontDict.Private.vstore = topDict.VarStore
+            if hasattr(topDict, "VarStore"):
+                varStore = topDict.VarStore
+                # VarStore is read after CharStrings in the XML, so the
+                # CharStrings converter could not wire it itself. Restore the
+                # reference now that the whole CFFFont has been imported;
+                # without it getGlyphSet(location=...) silently draws the
+                # default outlines at every variation position.
+                charStrings = getattr(topDict, "CharStrings", None)
+                if charStrings is not None:
+                    charStrings.varStore = varStore
+                fdArray = getattr(topDict, "FDArray", None)
+                if fdArray and getattr(fdArray[0], "vstore", None) is None:
+                    for fontDict in fdArray:
+                        if hasattr(fontDict, "Private"):
+                            fontDict.Private.vstore = varStore
 
         elif name == "GlobalSubrs":
             subrCharStringClass = psCharStrings.T2CharString
@@ -571,10 +603,23 @@ class CharStringsCompiler(GlobalSubrsCompiler):
     """Helper class for writing the `CharStrings INDEX <https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#9-local-and-global-subr-indexes>`_
     to binary."""
 
+    def __init__(self, items, strings, parent, isCFF2=None):
+        # ``items`` are ordered like the charset/glyph order. Remember the
+        # matching names so a compilation failure can name its glyph.
+        dictObj = getattr(parent, "dictObj", None)
+        charset = getattr(dictObj, "charset", None)
+        self._glyphNames = list(charset) if charset else []
+        super(CharStringsCompiler, self).__init__(items, strings, parent, isCFF2=isCFF2)
+
     def getItems(self, items, strings):
         out = []
-        for cs in items:
-            cs.compile(self.isCFF2)
+        for i, cs in enumerate(items):
+            try:
+                cs.compile(self.isCFF2)
+            except Exception as e:
+                glyphName = self._glyphNames[i] if i < len(self._glyphNames) else i
+                annotateException(e, "CFF2 CharString %r" % (glyphName,))
+                raise
             out.append(cs.bytecode)
         return out
 
@@ -1096,23 +1141,36 @@ class CharStrings(object):
             name, attrs, content = element
             if name != "CharString":
                 continue
-            fdID = -1
-            if hasattr(self, "fdArray"):
-                try:
-                    fdID = safeEval(attrs["fdSelectIndex"])
-                except KeyError:
-                    fdID = 0
-                private = self.fdArray[fdID].Private
-            else:
-                private = self.private
+            glyphName = attrs.get("name", "<unknown>")
+            try:
+                fdID = -1
+                if hasattr(self, "fdArray"):
+                    try:
+                        fdID = safeEval(attrs["fdSelectIndex"])
+                    except KeyError:
+                        fdID = 0
+                    try:
+                        private = self.fdArray[fdID].Private
+                    except (IndexError, KeyError, AttributeError) as e:
+                        raise type(e)(
+                            "fdSelectIndex %r does not resolve to a FontDict/Private "
+                            "in FDArray (size %d): %s"
+                            % (attrs.get("fdSelectIndex", 0), len(self.fdArray), e)
+                        ) from e
+                else:
+                    private = self.private
 
-            glyphName = attrs["name"]
-            charStringClass = psCharStrings.T2CharString
-            charString = charStringClass(private=private, globalSubrs=self.globalSubrs)
-            charString.fromXML(name, attrs, content)
-            if fdID >= 0:
-                charString.fdSelectIndex = fdID
-            self[glyphName] = charString
+                charStringClass = psCharStrings.T2CharString
+                charString = charStringClass(
+                    private=private, globalSubrs=self.globalSubrs
+                )
+                charString.fromXML(name, attrs, content)
+                if fdID >= 0:
+                    charString.fdSelectIndex = fdID
+                self[glyphName] = charString
+            except Exception as e:
+                annotateException(e, "CFF2 CharString %r" % glyphName)
+                raise
 
 
 def readCard8(file):
@@ -2627,11 +2685,14 @@ class TopDict(BaseDict):
 
     def decompileAllCharStrings(self):
         # Make sure that all the Private Dicts have been instantiated.
+        names = list(self.CharStrings.keys())
         for i, charString in enumerate(self.CharStrings.values()):
             try:
                 charString.decompile()
-            except:
-                log.error("Error in charstring %s", i)
+            except Exception as e:
+                glyphName = names[i] if i < len(names) else i
+                log.error("Error in charstring %s (glyph %r)", i, glyphName)
+                annotateException(e, "CFF2 CharString %r" % (glyphName,))
                 raise
 
     def recalcFontBBox(self):
