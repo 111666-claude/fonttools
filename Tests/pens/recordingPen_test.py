@@ -2,6 +2,7 @@ from fontTools.pens.recordingPen import (
     RecordingPen,
     DecomposingRecordingPen,
     RecordingPointPen,
+    replayRecording,
 )
 import pytest
 
@@ -28,6 +29,36 @@ class RecordingPenTest(object):
         pen = RecordingPen()
         pen.addComponent("a", (2, 0, 0, 3, -10, 5))
         assert pen.value == [("addComponent", ("a", (2, 0, 0, 3, -10, 5)))]
+
+    def test_addVarComponent_sparse_location(self):
+        pen = RecordingPen()
+        pen.addVarComponent("a", None, {"wght": 0.5})
+        # Unspecified axes are not filled in, and the default reset flag is
+        # not recorded, keeping existing recordings unchanged.
+        assert pen.value == [("addVarComponent", ("a", None, {"wght": 0.5}))]
+
+    def test_addVarComponent_reset_flag_recorded_and_replayed(self):
+        pen = RecordingPen()
+        pen.addVarComponent("a", None, {}, resetUnspecifiedAxes=True)
+        assert pen.value == [
+            ("addVarComponent", ("a", None, {}), {"resetUnspecifiedAxes": True})
+        ]
+
+        replayed = RecordingPen()
+        pen.replay(replayed)
+        assert replayed.value == pen.value
+
+    def test_replay_recording_without_kwargs(self):
+        # Recordings produced before the reset flag existed only have two
+        # items per entry and must keep replaying.
+        recording = [
+            ("moveTo", ((0, 0),)),
+            ("addVarComponent", ("a", None, {"wght": 0.25})),
+            ("closePath", ()),
+        ]
+        replayed = RecordingPen()
+        replayRecording(recording, replayed)
+        assert replayed.value == recording
 
 
 class DecomposingRecordingPenTest(object):
@@ -69,4 +100,20 @@ class RecordingPointPenTest:
         pen2 = RecordingPointPen()
         pen.replay(pen2)
 
+        assert pen2.value == pen.value
+
+    def test_addVarComponent_sparse_location_and_reset(self):
+        pen = RecordingPointPen()
+        pen.addVarComponent("a", None, {"wght": 0.5})
+        pen.addVarComponent("a", None, {}, resetUnspecifiedAxes=True)
+
+        # Unspecified axes stay out of the location, and the reset flag is
+        # only recorded when set.
+        assert pen.value == [
+            ("addVarComponent", ("a", None, {"wght": 0.5}), {}),
+            ("addVarComponent", ("a", None, {}), {"resetUnspecifiedAxes": True}),
+        ]
+
+        pen2 = RecordingPointPen()
+        pen.replay(pen2)
         assert pen2.value == pen.value

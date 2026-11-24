@@ -16,7 +16,7 @@ import pytest
 
 
 class OutlinePen(RecordingPen):
-    def addVarComponent(self, *args):
+    def addVarComponent(self, *args, **kwargs):
         raise AttributeError
 
 
@@ -25,6 +25,18 @@ def record_varc_outlines(font, location):
     result = {}
     for name in font["VARC"].table.Coverage.glyphs:
         pen = OutlinePen()
+        glyph_set[name].draw(pen)
+        result[name] = pen.value
+    return result
+
+
+def record_varc_components(font, location):
+    """Record VARC composite glyphs with a recording pen that keeps
+    components, so sparse locations and reset flags are observable."""
+    glyph_set = font.getGlyphSet(location=location, normalized=True)
+    result = {}
+    for name in font["VARC"].table.Coverage.glyphs:
+        pen = RecordingPen()
         glyph_set[name].draw(pen)
         result[name] = pen.value
     return result
@@ -88,6 +100,60 @@ def test_scale_upem_first_variation_is_transform_only():
     before = record_varc_outlines(font, location)
     font = scale_and_roundtrip(font)
     assert_scaled_outlines(before, record_varc_outlines(font, location))
+
+
+@pytest.mark.parametrize("location", [{}, {"wght": 0.5}, {"wght": 1, "wdth": 1}])
+def test_scale_upem_preserves_sparse_component_locations(location):
+    """UPM scaling must keep component locations sparse and preserve the
+    reset flag, while still scaling component translations."""
+    font = TTFont(ScaleUpemTest.get_path("varc-6868.ttf"))
+    composites = font["VARC"].table.VarCompositeGlyphs.VarCompositeGlyph
+    # Make sure both flavors are present: one plain component and one that
+    # resets unspecified axes, plus a repeated component.
+    first = composites[0].components[0]
+    resetting = deepcopy(first)
+    resetting.flags |= ot.VarComponentFlags.RESET_UNSPECIFIED_AXES
+    composites[0].components.append(resetting)
+    composites[0].components.append(deepcopy(first))
+
+    before = record_varc_components(font, location)
+    font = scale_and_roundtrip(font)
+    after = record_varc_components(font, location)
+
+    assert before.keys() == after.keys()
+    factor = 2
+    for name in before:
+        assert len(before[name]) == len(after[name])
+        for beforeEntry, afterEntry in zip(before[name], after[name]):
+            op, beforeArgs = beforeEntry[:2]
+            new_op, newArgs = afterEntry[:2]
+            assert op == new_op == "addVarComponent"
+            beforeName, beforeTransform, beforeAxes = beforeArgs
+            newName, newTransform, newAxes = newArgs
+            assert beforeName == newName
+            # Locations stay sparse and unchanged.
+            assert beforeAxes == newAxes
+            assert newTransform.translateX == pytest.approx(
+                factor * beforeTransform.translateX
+            )
+            assert newTransform.translateY == pytest.approx(
+                factor * beforeTransform.translateY
+            )
+            # Scale/skew/rotation are unitless and unchanged.
+            assert newTransform.scaleX == pytest.approx(beforeTransform.scaleX)
+            assert newTransform.scaleY == pytest.approx(beforeTransform.scaleY)
+
+    # The reset flag must be present in the same places before and after.
+    def reset_flags(recording):
+        return [entry[2] if len(entry) > 2 else {} for entry in recording]
+
+    assert any(
+        kwargs.get("resetUnspecifiedAxes")
+        for name in after
+        for kwargs in reset_flags(after[name])
+    )
+    for name in before:
+        assert reset_flags(before[name]) == reset_flags(after[name])
 
 
 @pytest.mark.parametrize("wrapper_format", [None, 3, 4, 5])

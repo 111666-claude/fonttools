@@ -137,11 +137,19 @@ class AbstractPen:
         glyphName: str,
         transformation: DecomposedTransform,
         location: Dict[str, float],
+        *,
+        resetUnspecifiedAxes: bool = False,
     ) -> None:
         """Add a VarComponent sub glyph. The 'transformation' argument
         must be a DecomposedTransform from the fontTools.misc.transform module,
         and the 'location' argument must be a dictionary mapping axis tags
         to their locations.
+
+        The location is sparse: it contains only the axes that the component
+        explicitly sets, and must not be filled in with default values. If
+        'resetUnspecifiedAxes' is true, axes that are not in the location use
+        the font's current variation settings instead of inheriting the values
+        of the parent component.
         """
         # GlyphSet decomposes for us
         raise AttributeError
@@ -171,7 +179,9 @@ class NullPen(AbstractPen):
     def addComponent(self, glyphName, transformation):
         pass
 
-    def addVarComponent(self, glyphName, transformation, location):
+    def addVarComponent(
+        self, glyphName, transformation, location, *, resetUnspecifiedAxes=False
+    ):
         pass
 
 
@@ -255,7 +265,9 @@ class DecomposingPen(LoggingPen):
                     pen = ReverseContourPen(pen)
             glyph.draw(pen)
 
-    def addVarComponent(self, glyphName, transformation, location):
+    def addVarComponent(
+        self, glyphName, transformation, location, *, resetUnspecifiedAxes=False
+    ):
         # GlyphSet decomposes for us
         raise AttributeError
 

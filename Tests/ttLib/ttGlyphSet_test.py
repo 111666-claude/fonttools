@@ -263,6 +263,223 @@ class TTGlyphSetTest(object):
         font.save(stream)
         check(TTFont(BytesIO(stream.getvalue())))
 
+    @staticmethod
+    def _build_sparse_varc_font():
+        """Build a small VARC font with nested, repeated, and transformed
+        components, some of which reset unspecified axes.
+
+        The glyph layout is::
+
+            outer  -> mid (wdth=0.75, translated), mid, mid (reset),
+                      mid (wdth=0.75, translated)
+            mid    -> inner
+            inner  -> I (plain glyf glyph with wght variation, wght=0.25)
+        """
+        from fontTools.ttLib import newTable
+        from fontTools.ttLib.tables import otTables as ot
+
+        font = TTFont(TTGlyphSetTest.getpath("I.ttf"))
+        # Decompile before extending the glyph order so gvar matches maxp.
+        font["gvar"]
+        font["glyf"]
+
+        order = list(font.getGlyphOrder()) + ["inner", "mid", "outer"]
+        font.setGlyphOrder(order)
+        font["glyf"].setGlyphOrder(order)
+        from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+        for name in ("inner", "mid", "outer"):
+            font["glyf"][name] = Glyph()
+            font["hmtx"][name] = font["hmtx"]["I"]
+        # Format 3.0 does not store glyph names; use 2.0 so they round-trip.
+        font["post"].formatType = 2.0
+        font["post"].extraNames = []
+        font["post"].mapping = {}
+
+        def component(name, axes=None, values=(), reset=False, translate=None):
+            comp = ot.VarComponent()
+            comp.glyphName = name
+            if axes is not None:
+                comp.axisIndicesIndex = axes
+                comp.axisValues = tuple(values)
+            if reset:
+                comp.flags |= ot.VarComponentFlags.RESET_UNSPECIFIED_AXES
+            if translate is not None:
+                comp.flags |= (
+                    ot.VarComponentFlags.HAVE_TRANSLATE_X
+                    | ot.VarComponentFlags.HAVE_TRANSLATE_Y
+                )
+                comp.transform.translateX, comp.transform.translateY = translate
+            return comp
+
+        varc = font["VARC"] = newTable("VARC")
+        varc.table = ot.VARC()
+        varc.table.Version = 0x00010000
+        varc.table.Coverage = ot.Coverage()
+        varc.table.Coverage.glyphs = ["inner", "mid", "outer"]
+        varc.table.MultiVarStore = None
+        varc.table.ConditionList = None
+        varc.table.AxisIndicesList = ot.AxisIndicesList()
+        # I.ttf axes are wght=0, wdth=1, opsz=2, ...
+        varc.table.AxisIndicesList.Item = [[0], [1]]
+        varc.table.VarCompositeGlyphs = ot.VarCompositeGlyphs()
+        varc.table.VarCompositeGlyphs.VarCompositeGlyph = [
+            ot.VarCompositeGlyph([component("I", axes=0, values=(0.25,))]),
+            ot.VarCompositeGlyph([component("inner")]),
+            ot.VarCompositeGlyph(
+                [
+                    component("mid", axes=1, values=(0.75,), translate=(10, 20)),
+                    component("mid"),
+                    component("mid", reset=True),
+                    component("mid", axes=1, values=(0.75,), translate=(10, 20)),
+                ]
+            ),
+        ]
+        return font
+
+    @staticmethod
+    def _roundtrip(font):
+        stream = BytesIO()
+        font.save(stream)
+        return TTFont(BytesIO(stream.getvalue()))
+
+    @staticmethod
+    def _replay_var_components(recording, glyphset, outPen, points):
+        """Replay a VARC recording the way a client must: push the recorded
+        sparse location on both glyph sets, honoring the reset flag."""
+        from fontTools.pens.transformPen import TransformPen, TransformPointPen
+
+        transformPenType = TransformPointPen if points else TransformPen
+        draw = "drawPoints" if points else "draw"
+        for entry in recording:
+            operator, operands = entry[:2]
+            kwargs = entry[2] if len(entry) > 2 else {}
+            assert operator == "addVarComponent"
+            name, transform, location = operands
+            reset = kwargs.get("resetUnspecifiedAxes", False)
+            with glyphset.glyphSet.pushLocation(location, reset):
+                with glyphset.pushLocation(location, reset):
+                    getattr(glyphset[name], draw)(
+                        transformPenType(outPen, transform.toTransform())
+                    )
+
+    @pytest.mark.parametrize("location", [{"wght": 0.5}, {"wght": 0.9, "wdth": 0.2}])
+    @pytest.mark.parametrize("points", [False, True])
+    def test_varc_sparse_component_locations(self, location, points):
+        from fontTools.pens.recordingPen import DecomposingRecordingPointPen
+
+        class OutlinePointPen(DecomposingRecordingPointPen):
+            def addVarComponent(self, *args, **kwargs):
+                raise AttributeError
+
+        recordingPenType = RecordingPointPen if points else RecordingPen
+        decomposingPenType = OutlinePointPen if points else DecomposingRecordingPen
+        draw = "drawPoints" if points else "draw"
+
+        font = self._roundtrip(self._build_sparse_varc_font())
+        glyphset = font.getGlyphSet(location=location, normalized=True)
+
+        recording = recordingPenType()
+        getattr(glyphset["outer"], draw)(recording)
+
+        # The recording must be sparse: only explicitly-set axes appear, and
+        # no default values are filled in.
+        assert len(recording.value) == 4
+        entries = []
+        for entry in recording.value:
+            operator, operands = entry[:2]
+            kwargs = entry[2] if len(entry) > 2 else {}
+            assert operator == "addVarComponent"
+            name, transform, axes = operands
+            entries.append((name, transform, axes, kwargs))
+        assert all(name == "mid" for name, _, _, _ in entries)
+        assert [axes for _, _, axes, _ in entries] == [
+            {"wdth": 0.75},
+            {},
+            {},
+            {"wdth": 0.75},
+        ]
+        assert [kwargs for _, _, _, kwargs in entries] == [
+            {},
+            {},
+            {"resetUnspecifiedAxes": True},
+            {},
+        ]
+        assert entries[0][1].translateX == 10
+        assert entries[0][1].translateY == 20
+        assert entries[3][1].translateX == 10
+        assert entries[3][1].translateY == 20
+
+        # Replaying the recording must reproduce the decomposed outline,
+        # including nested components and reset semantics.
+        expected = decomposingPenType(glyphset)
+        getattr(glyphset["outer"], draw)(expected)
+        replayed = decomposingPenType(glyphset)
+        self._replay_var_components(recording.value, glyphset, replayed, points)
+        assert replayed.value == expected.value
+
+        # Recording. Decomposing and replaying again must be stable.
+        secondRecording = recordingPenType()
+        getattr(glyphset["outer"], draw)(secondRecording)
+        assert secondRecording.value == recording.value
+
+        # The same must hold after a binary round-trip.
+        roundtripped = self._roundtrip(font)
+        glyphset = roundtripped.getGlyphSet(location=location, normalized=True)
+        recording = recordingPenType()
+        getattr(glyphset["outer"], draw)(recording)
+        assert [entry[:2] for entry in recording.value] == [
+            entry[:2] for entry in secondRecording.value
+        ]
+        assert [entry[2] if len(entry) > 2 else {} for entry in recording.value] == [
+            entry[2] if len(entry) > 2 else {} for entry in secondRecording.value
+        ]
+        expected = decomposingPenType(glyphset)
+        getattr(glyphset["outer"], draw)(expected)
+        replayed = decomposingPenType(glyphset)
+        self._replay_var_components(recording.value, glyphset, replayed, points)
+        assert replayed.value == expected.value
+
+    @pytest.mark.parametrize("location", [{"wght": 0.5}, {"wght": 0.9, "wdth": 0.2}])
+    def test_varc_sparse_locations_with_pushed_parent(self, location):
+        """Drawing a VARC glyph under a pushed parent location keeps the
+        recorded component locations sparse, and replaying them honors the
+        reset flag instead of inheriting the pushed axes."""
+        from fontTools.pens.recordingPen import (
+            DecomposingRecordingPen,
+            RecordingPen,
+        )
+
+        font = self._roundtrip(self._build_sparse_varc_font())
+        glyphset = font.getGlyphSet(location=location, normalized=True)
+
+        reference = RecordingPen()
+        glyphset["outer"].draw(reference)
+
+        pushedLocation = {"wdth": 0.75}
+        with glyphset.glyphSet.pushLocation(pushedLocation, False):
+            with glyphset.pushLocation(pushedLocation, False):
+                pen = RecordingPen()
+                glyphset["outer"].draw(pen)
+                # Inherited axes must not leak into the sparse recording.
+                assert pen.value == reference.value
+
+                expected = DecomposingRecordingPen(glyphset)
+                glyphset["outer"].draw(expected)
+                replayed = DecomposingRecordingPen(glyphset)
+                self._replay_var_components(pen.value, glyphset, replayed, points=False)
+                assert replayed.value == expected.value
+
+                # Dropping the reset flag changes the outline, because the
+                # component would then inherit the pushed wdth instead of
+                # resetting to the font's original location.
+                noReset = [(entry[0], entry[1], {}) for entry in pen.value]
+                withoutReset = DecomposingRecordingPen(glyphset)
+                self._replay_var_components(
+                    noReset, glyphset, withoutReset, points=False
+                )
+                assert withoutReset.value != expected.value
+
     @pytest.mark.parametrize(
         "fontfile, locations, factor, expected",
         [

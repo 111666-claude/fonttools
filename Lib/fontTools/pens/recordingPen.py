@@ -18,11 +18,14 @@ def replayRecording(recording, pen):
     to a pen.
 
     Note that recording does not have to be produced by those pens.
-    It can be any iterable of tuples of method name and tuple-of-arguments.
+    It can be any iterable of tuples of method name and tuple-of-arguments,
+    optionally followed by a dictionary of keyword arguments.
     Likewise, pen can be any objects receiving those method calls.
     """
-    for operator, operands in recording:
-        getattr(pen, operator)(*operands)
+    for entry in recording:
+        operator, operands = entry[:2]
+        kwargs = entry[2] if len(entry) > 2 else {}
+        getattr(pen, operator)(*operands, **kwargs)
 
 
 class RecordingPen(AbstractPen):
@@ -73,8 +76,14 @@ class RecordingPen(AbstractPen):
     def addComponent(self, glyphName, transformation):
         self.value.append(("addComponent", (glyphName, transformation)))
 
-    def addVarComponent(self, glyphName, transformation, location):
-        self.value.append(("addVarComponent", (glyphName, transformation, location)))
+    def addVarComponent(
+        self, glyphName, transformation, location, *, resetUnspecifiedAxes=False
+    ):
+        kwargs = {"resetUnspecifiedAxes": True} if resetUnspecifiedAxes else {}
+        entry = ("addVarComponent", (glyphName, transformation, location))
+        if kwargs:
+            entry += (kwargs,)
+        self.value.append(entry)
 
     def replay(self, pen):
         replayRecording(self.value, pen)

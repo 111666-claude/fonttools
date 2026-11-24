@@ -93,12 +93,20 @@ class AbstractPointPen:
         transformation: DecomposedTransform,
         location: Dict[str, float],
         identifier: Optional[str] = None,
+        *,
+        resetUnspecifiedAxes: bool = False,
         **kwargs: Any,
     ) -> None:
         """Add a VarComponent sub glyph. The 'transformation' argument
         must be a DecomposedTransform from the fontTools.misc.transform module,
         and the 'location' argument must be a dictionary mapping axis tags
         to their locations.
+
+        The location is sparse: it contains only the axes that the component
+        explicitly sets, and must not be filled in with default values. If
+        'resetUnspecifiedAxes' is true, axes that are not in the location use
+        the font's current variation settings instead of inheriting the values
+        of the parent component.
         """
         # ttGlyphSet decomposes for us
         raise AttributeError
