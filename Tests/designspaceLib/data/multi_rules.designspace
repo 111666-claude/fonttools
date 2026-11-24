@@ -1,0 +1,123 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  A small, realistic designspace used by the multi-rule contract tests in
+  Tests/designspaceLib/designspace_rules_test.py.
+
+  It has two mapped axes (so user and design coordinates differ), nine rules
+  that overlap in several places, rules with several conditionsets (OR) and
+  several conditions (AND), open-ended conditions, chained substitutions
+  across rules, an exact duplicate rule, an always-on rule and a rule
+  without any conditionset (which must never match).
+-->
+<designspace format="5.0">
+  <axes>
+    <axis tag="wght" name="Weight" minimum="300" default="400" maximum="900">
+      <map input="300" output="0"/>
+      <map input="400" output="100"/>
+      <map input="700" output="600"/>
+      <map input="900" output="1000"/>
+    </axis>
+    <axis tag="wdth" name="Width" minimum="50" default="100" maximum="200">
+      <map input="50" output="0"/>
+      <map input="100" output="500"/>
+      <map input="200" output="1000"/>
+    </axis>
+  </axes>
+  <rules processing="last">
+    <!-- Two conditionsets (OR). Each conditionset combines its conditions
+         with AND. Also the first link of the slash -> slash.wide ->
+         slash.final chain. -->
+    <rule name="slash.wide">
+      <conditionset>
+        <condition name="Weight" minimum="500" maximum="1000"/>
+        <condition name="Width" minimum="0" maximum="400"/>
+      </conditionset>
+      <conditionset>
+        <condition name="Width" minimum="750"/>
+      </conditionset>
+      <sub name="slash" with="slash.wide"/>
+    </rule>
+    <!-- Second link of the slash chain; only applies after slash.wide. -->
+    <rule name="slash.final">
+      <conditionset>
+        <condition name="Weight" minimum="700"/>
+      </conditionset>
+      <sub name="slash.wide" with="slash.final"/>
+    </rule>
+    <!-- First link of the dollar chain. -->
+    <rule name="dollar.to.alt">
+      <conditionset>
+        <condition name="Width" maximum="500"/>
+      </conditionset>
+      <sub name="dollar" with="dollar.alt"/>
+    </rule>
+    <!-- Second link of the dollar chain. -->
+    <rule name="dollar.to.alt2">
+      <conditionset>
+        <condition name="Weight" minimum="500"/>
+      </conditionset>
+      <sub name="dollar.alt" with="dollar.alt2"/>
+    </rule>
+    <!-- Exact duplicate: same name, same conditions, same substitution. -->
+    <rule name="ampersand.alt">
+      <conditionset>
+        <condition name="Width" maximum="500"/>
+      </conditionset>
+      <conditionset>
+        <condition name="Weight" minimum="500"/>
+      </conditionset>
+      <sub name="ampersand" with="ampersand.alt"/>
+    </rule>
+    <rule name="ampersand.alt">
+      <conditionset>
+        <condition name="Width" maximum="500"/>
+      </conditionset>
+      <conditionset>
+        <condition name="Weight" minimum="500"/>
+      </conditionset>
+      <sub name="ampersand" with="ampersand.alt"/>
+    </rule>
+    <!-- Matches at (and below) the Weight default in design coordinates. -->
+    <rule name="default.weight">
+      <conditionset>
+        <condition name="Weight" maximum="200"/>
+      </conditionset>
+      <sub name="three" with="three.alt"/>
+    </rule>
+    <!-- An empty conditionset is the canonical always-on rule. -->
+    <rule name="always">
+      <conditionset/>
+      <sub name="zero" with="zero.osf"/>
+    </rule>
+    <!-- No conditionset at all: this rule must never match. -->
+    <rule name="never">
+      <sub name="two" with="two.alt"/>
+    </rule>
+  </rules>
+  <sources>
+    <source filename="master-light-narrow.ufo" name="master.light.narrow">
+      <location>
+        <dimension name="Weight" xvalue="0"/>
+        <dimension name="Width" xvalue="0"/>
+      </location>
+    </source>
+    <source filename="master-bold-narrow.ufo" name="master.bold.narrow">
+      <location>
+        <dimension name="Weight" xvalue="1000"/>
+        <dimension name="Width" xvalue="0"/>
+      </location>
+    </source>
+    <source filename="master-light-wide.ufo" name="master.light.wide">
+      <location>
+        <dimension name="Weight" xvalue="0"/>
+        <dimension name="Width" xvalue="1000"/>
+      </location>
+    </source>
+    <source filename="master-bold-wide.ufo" name="master.bold.wide">
+      <location>
+        <dimension name="Weight" xvalue="1000"/>
+        <dimension name="Width" xvalue="1000"/>
+      </location>
+    </source>
+  </sources>
+</designspace>
