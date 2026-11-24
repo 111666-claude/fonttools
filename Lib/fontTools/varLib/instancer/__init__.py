@@ -130,6 +130,7 @@ from .featureVars import instantiateFeatureVariations
 from .colr import instantiateCOLR
 from fontTools.misc.cliTools import makeOutputFileName
 from fontTools.varLib.instancer import solver
+from fontTools.ttLib.tables import otTables as ot
 from fontTools.ttLib.tables.otTables import VarComponentFlags
 import collections
 import dataclasses
@@ -572,7 +573,7 @@ def instantiateVARC(varfont, axisLimits):
 
 
 def instantiateTupleVariationStore(
-    variations, axisLimits, origCoords=None, endPts=None
+    variations, axisLimits, origCoords=None, endPts=None, keepFractional=None
 ):
     """Instantiate TupleVariation list at the given location, or limit axes' min/max.
 
@@ -601,6 +602,10 @@ def instantiateTupleVariationStore(
         origCoords: GlyphCoordinates: default instance's coordinates for computing 'gvar'
             inferred points (cf. table__g_l_y_f._getCoordinatesAndControls).
         endPts: List[int]: indices of contour end points, for inferring 'gvar' deltas.
+        keepFractional: optional set of item (column) indices whose surviving
+            deltas must not be rounded. CFF2 outline blends are integer-valued,
+            but Private DICT blends (blue zones, stem widths, BlueScale...) are
+            real-valued; rounding their deltas would drift every later location.
 
     Returns:
         List[float]: the overall delta adjustment after applicable deltas were summed.
@@ -626,7 +631,17 @@ def instantiateTupleVariationStore(
     defaultVar = mergedVariations.pop(frozenset(), None)
 
     for var in mergedVariations.values():
-        var.roundDeltas()
+        if keepFractional:
+            # Round every delta except the columns that must stay real-valued
+            # (CFF2 Private DICT blends). None entries need no rounding.
+            var.coordinates = [
+                delta
+                if i in keepFractional or delta is None
+                else otRound(delta)
+                for i, delta in enumerate(var.coordinates)
+            ]
+        else:
+            var.roundDeltas()
     variations[:] = list(mergedVariations.values())
 
     return defaultVar.coordinates if defaultVar is not None else []
@@ -836,6 +851,17 @@ def instantiateCFF2(
         assert varData.Item == []
         assert varData.ItemCount == 0
 
+    # Item columns holding CFF2 Private DICT blends, keyed by VarData index.
+    # Their operands are real numbers, so their deltas must survive instancing
+    # without the integer rounding that outline deltas receive.
+    keepFractional = [set() for _ in varStore.VarData]
+
+    def storePrivateBlendsToVarStore(arg):
+        start = varStore.VarData[vsindex].ItemCount
+        storeBlendsToVarStore(arg)
+        end = varStore.VarData[vsindex].ItemCount
+        keepFractional[vsindex].update(range(start, end))
+
     # Add charstring blend lists to VarStore so we can instantiate them
     for cs, commands, _ in charStringData:
         vsindex = getattr(cs.private, "vsindex", 0)
@@ -865,16 +891,22 @@ def instantiateCFF2(
 
                 assert len(value) % (getNumRegions(vsindex) + 1) == 0
                 count = len(value) // (getNumRegions(vsindex) + 1)
-                storeBlendsToVarStore(value + [count])
+                storePrivateBlendsToVarStore(value + [count])
 
     # Instantiate VarStore
     defaultDeltas = instantiateItemVariationStore(
-        varStore, fvarAxes, axisLimits, hierarchical=True
+        varStore,
+        fvarAxes,
+        axisLimits,
+        hierarchical=True,
+        keepFractional=keepFractional,
     )
 
     # Optionally cull dead regions (for avar2 partial instancing)
     if reachableRanges:
-        _cullItemVariationStore(varStore, fvarAxes, reachableRanges)
+        _cullItemVariationStore(
+            varStore, fvarAxes, reachableRanges, keepFractional=keepFractional
+        )
 
     # Read back new charstring blends from the instantiated VarStore
     varDataCursor = [0] * len(varStore.VarData)
@@ -896,6 +928,11 @@ def instantiateCFF2(
             commands[:] = specializeCommands(commands, generalizeFirst=False)
 
     # Read back new private blends from the instantiated VarStore
+    # Private DICT values are absolute font-wide metrics and hinting values
+    # (blue zones, stem widths, BlueScale...), not integer outline coordinates:
+    # CFF DICT operands may be real numbers. Rounding the delta dissolved into a
+    # rebased default would shift every later location, so keep the fractions
+    # and leave rounding to the integer-required glyph data above.
     for private in privateDicts:
         vsindex = getattr(private, "vsindex", 0)
         for opcode, name, arg_type, default, converter in privateDictOperators2:
@@ -915,7 +952,7 @@ def instantiateCFF2(
                     continue
 
                 value.append(1)
-                value = fetchBlendsFromVarStore(value)
+                value = fetchBlendsFromVarStore(value, round=noRound)
                 newValues.extend(v[:-1] if isinstance(v, list) else v for v in value)
 
             if arg_type == "number":
@@ -1274,14 +1311,32 @@ def instantiateVVAR(varfont, axisLimits):
 
 
 class _TupleVarStoreAdapter(object):
-    def __init__(self, regions, axisOrder, tupleVarData, itemCounts):
+    def __init__(
+        self, regions, axisOrder, tupleVarData, itemCounts, keepFractional=None
+    ):
         self.regions = regions
         self.axisOrder = axisOrder
         self.tupleVarData = tupleVarData
         self.itemCounts = itemCounts
+        # Per-VarData sets of item (column) indices whose deltas are real
+        # numbers (CFF2 Private DICT blends) and must survive without rounding.
+        # avar2 offset compensation can append VarData rows after construction,
+        # so the list is grown lazily in _getKeepFractional rather than assumed
+        # to stay the length captured here.
+        if keepFractional is None:
+            keepFractional = []
+        self.keepFractional = keepFractional
+
+    def _getKeepFractional(self):
+        # Return one mask set per current VarData, adding empty sets for any
+        # rows appended (e.g. avar2 offset compensation) after this adapter was
+        # built so integer rounding still applies to them.
+        while len(self.keepFractional) < len(self.itemCounts):
+            self.keepFractional.append(set())
+        return self.keepFractional
 
     @classmethod
-    def fromItemVarStore(cls, itemVarStore, fvarAxes):
+    def fromItemVarStore(cls, itemVarStore, fvarAxes, keepFractional=None):
         axisOrder = [axis.axisTag for axis in fvarAxes]
         regions = [
             region.get_support(fvarAxes) for region in itemVarStore.VarRegionList.Region
@@ -1295,7 +1350,9 @@ class _TupleVarStoreAdapter(object):
                 variations.append(TupleVariation(axes, list(coordinates)))
             tupleVarData.append(variations)
             itemCounts.append(varData.ItemCount)
-        return cls(regions, axisOrder, tupleVarData, itemCounts)
+        return cls(
+            regions, axisOrder, tupleVarData, itemCounts, keepFractional
+        )
 
     def rebuildRegions(self):
         # Collect the set of all unique region axes from the current TupleVariations.
@@ -1321,8 +1378,12 @@ class _TupleVarStoreAdapter(object):
 
     def instantiate(self, axisLimits):
         defaultDeltaArray = []
-        for variations, itemCount in zip(self.tupleVarData, self.itemCounts):
-            defaultDeltas = instantiateTupleVariationStore(variations, axisLimits)
+        for variations, itemCount, keep in zip(
+            self.tupleVarData, self.itemCounts, self._getKeepFractional()
+        ):
+            defaultDeltas = instantiateTupleVariationStore(
+                variations, axisLimits, keepFractional=keep
+            )
             if not defaultDeltas:
                 defaultDeltas = [0] * itemCount
             defaultDeltaArray.append(defaultDeltas)
@@ -1340,16 +1401,35 @@ class _TupleVarStoreAdapter(object):
     def asItemVarStore(self):
         regionOrder = [frozenset(axes.items()) for axes in self.regions]
         varDatas = []
-        for variations, itemCount in zip(self.tupleVarData, self.itemCounts):
+        for variations, itemCount, keep in zip(
+            self.tupleVarData, self.itemCounts, self._getKeepFractional()
+        ):
             if variations:
                 assert len(variations[0].coordinates) == itemCount
                 varRegionIndices = [
                     regionOrder.index(frozenset(var.axes.items())) for var in variations
                 ]
                 varDataItems = list(zip(*(var.coordinates for var in variations)))
-                varDatas.append(
-                    builder.buildVarData(varRegionIndices, varDataItems, optimize=False)
-                )
+                if not keep:
+                    # Integer deltas: keep the standard build path so NumShorts
+                    # and column ordering behave exactly as before.
+                    varDatas.append(
+                        builder.buildVarData(
+                            varRegionIndices, varDataItems, optimize=False
+                        )
+                    )
+                    continue
+                varData = ot.VarData()
+                varData.VarRegionIndex = list(varRegionIndices)
+                varData.VarRegionCount = len(varData.VarRegionIndex)
+                varData.Item = [list(item) for item in varDataItems]
+                varData.ItemCount = len(varData.Item)
+                # Real-valued CFF2 Private DICT deltas cannot go through
+                # NumShorts' integer bit-length logic. These items are only read
+                # back in memory and emptied before the font is saved, so mark
+                # every column as long-word and skip optimization entirely.
+                varData.NumShorts = varData.VarRegionCount | 0x8000
+                varDatas.append(varData)
             else:
                 varDatas.append(
                     builder.buildVarData([], [[] for _ in range(itemCount)])
@@ -1362,7 +1442,7 @@ class _TupleVarStoreAdapter(object):
 
 
 def instantiateItemVariationStore(
-    itemVarStore, fvarAxes, axisLimits, hierarchical=False
+    itemVarStore, fvarAxes, axisLimits, hierarchical=False, keepFractional=None
 ):
     """Compute deltas at partial location, and update varStore in-place.
 
@@ -1380,12 +1460,17 @@ def instantiateItemVariationStore(
         axisLimits: NormalizedAxisLimits: mapping axis tags to normalized
             min/default/max axis coordinates. May not specify coordinates/ranges for
             all the fvar axes.
+        keepFractional: optional list of sets of item indices, one per VarData,
+            marking CFF2 Private DICT blends whose real-valued deltas must not be
+            rounded while the neighboring integer outline deltas are rounded.
 
     Returns:
         defaultDeltas: to be added to the default instance, of type dict of floats
             keyed by VariationIndex compound values: i.e. (outer << 16) + inner.
     """
-    tupleVarStore = _TupleVarStoreAdapter.fromItemVarStore(itemVarStore, fvarAxes)
+    tupleVarStore = _TupleVarStoreAdapter.fromItemVarStore(
+        itemVarStore, fvarAxes, keepFractional
+    )
     defaultDeltaArray = tupleVarStore.instantiate(axisLimits)
     newItemVarStore = tupleVarStore.asItemVarStore()
 
@@ -2179,13 +2264,17 @@ def _isTupleVariationDead(tv, reachableRanges):
     return False
 
 
-def _cullItemVariationStore(varStore, fvarAxes, reachableRanges):
+def _cullItemVariationStore(
+    varStore, fvarAxes, reachableRanges, keepFractional=None
+):
     """Remove dead regions from an ItemVariationStore via TupleVariation culling.
 
     Converts to TupleVariations, removes dead ones, converts back.
     Returns the number of removed regions.
     """
-    tupleVarStore = _TupleVarStoreAdapter.fromItemVarStore(varStore, fvarAxes)
+    tupleVarStore = _TupleVarStoreAdapter.fromItemVarStore(
+        varStore, fvarAxes, keepFractional
+    )
     totalCulled = 0
     for tvList in tupleVarStore.tupleVarData:
         before = len(tvList)

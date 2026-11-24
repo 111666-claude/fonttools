@@ -436,16 +436,102 @@ class InstantiateCFF2RoundingTest:
         assertCloseTo(rebased, {}, vf, {"wght": 400}, 1)
 
     def test_fractional_private_dict_values(self):
+        # Private DICT blends are real-valued CFF operands, unlike the integer
+        # outline deltas. Pinning or rebasing an axis must not round away their
+        # fractional deltas, or every later location drifts.
         vf = makeRingVF(TWO_MASTERS)
         private = vf["CFF2"].cff.topDictIndex[0].FDArray[0].Private
         private.BlueScale = [0.039625, 0.02]
+        private.BlueValues = [[-10.5, 3.25]]
+        private.StdVW = [80.25, 10.75]
         vf = reload(vf)
 
-        rebased = instancer.instantiateVariableFont(vf, {"wght": (300, 600, 900)})
+        # wght 600 sits at normalized 0.5; the dissolved delta is kept exact.
+        rebased = reload(
+            instancer.instantiateVariableFont(vf, {"wght": (300, 600, 900)})
+        )
+        private = rebased["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        assert private.BlueScale[0] == pytest.approx(0.039625 + 0.02 * 0.5)
+        assert private.BlueValues[0][0] == pytest.approx(-10.5 + 3.25 * 0.5)
+        assert private.StdVW[0] == pytest.approx(80.25 + 10.75 * 0.5)
+        # The surviving region deltas keep their fractions instead of being
+        # rounded to whole values.
+        assert any(
+            isinstance(value, float) and not value.is_integer()
+            for value in private.BlueScale[1:]
+        )
+        assert any(
+            isinstance(value, float) and not value.is_integer()
+            for value in private.BlueValues[0][1:]
+        )
+
+        # A full instance at the same location collapses to the same plain value.
+        full = reload(instancer.instantiateVariableFont(deepcopy(vf), {"wght": 600}))
+        full_private = full["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        assert full_private.BlueScale == pytest.approx(private.BlueScale[0])
+        assert full_private.BlueValues == pytest.approx(
+            [private.BlueValues[0][0]]
+        )
+        assert full_private.StdVW == pytest.approx(private.StdVW[0])
+
+        # Re-instancing the partial font to a static instance matches pinning
+        # the original font directly: no error accumulates across the rounds.
+        again = reload(
+            instancer.instantiateVariableFont(deepcopy(rebased), {"wght": 900})
+        )
+        direct = reload(instancer.instantiateVariableFont(deepcopy(vf), {"wght": 900}))
+        again_private = again["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        direct_private = direct["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        assert again_private.BlueScale == pytest.approx(direct_private.BlueScale)
+        assert again_private.BlueValues == pytest.approx(direct_private.BlueValues)
+        assert again_private.StdVW == pytest.approx(direct_private.StdVW)
+        assert direct_private.BlueScale == pytest.approx(0.039625 + 0.02)
+        assert direct_private.BlueValues == pytest.approx([-7.25])
+        assert direct_private.StdVW == pytest.approx(91.0)
+
+    def test_fractional_private_dict_with_vsindex(self):
+        # The fractional Private DICT blend lives in VarData 1 while the
+        # outline blends stay in VarData 0. The fractional column mask must
+        # track the right VarData, and the surviving vsindex must stay valid.
+        vf = makeRingVF(TWO_MASTERS)
+        topDict = vf["CFF2"].cff.topDictIndex[0]
+        varStore = topDict.VarStore.otVarStore
+        # Insert an empty VarData in front, shifting the blends to index 1.
+        varStore.VarData.insert(0, builder.buildVarData([], []))
+        varStore.VarDataCount = len(varStore.VarData)
+        private = topDict.FDArray[0].Private
+        private.vsindex = 1
+        private.BlueScale = [0.5, 0.25]
+        private.StdVW = [80.25, 10.75]
+        vf = reload(vf)
+
+        rebased = reload(
+            instancer.instantiateVariableFont(vf, {"wght": (300, 600, 900)})
+        )
 
         private = rebased["CFF2"].cff.topDictIndex[0].FDArray[0].Private
-        # Not rounded to a whole value; its delta is, as before.
-        assert private.BlueScale[0] == pytest.approx(0.039625)
+        # wght 600 is normalized 0.5: the rebased default keeps the exact
+        # fractional dissolved delta.
+        assert private.BlueScale[0] == pytest.approx(0.5 + 0.25 * 0.5)
+        assert private.StdVW[0] == pytest.approx(80.25 + 10.75 * 0.5)
+        # The remaining region deltas are still real numbers, not integers.
+        assert any(
+            isinstance(value, float) and not value.is_integer()
+            for value in private.BlueScale[1:]
+        )
+        # Outlines are still rounded to integers as before.
+        assertClosed(rebased, {})
+        assertCloseTo(rebased, {}, vf, {"wght": 600}, 0.5)
+
+        # A later full pin on the rebased font matches pinning the original.
+        again = reload(
+            instancer.instantiateVariableFont(deepcopy(rebased), {"wght": 900})
+        )
+        direct = reload(instancer.instantiateVariableFont(deepcopy(vf), {"wght": 900}))
+        again_private = again["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        direct_private = direct["CFF2"].cff.topDictIndex[0].FDArray[0].Private
+        assert again_private.BlueScale == pytest.approx(direct_private.BlueScale)
+        assert again_private.StdVW == pytest.approx(direct_private.StdVW)
 
     def test_private_dict_vsindex_and_charstring_vsindex(self):
         # Private DICT VarData 1 is emptied; the charstring's VarData 0 stays
