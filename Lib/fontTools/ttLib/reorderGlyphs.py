@@ -240,6 +240,88 @@ def _traverse_ot_data(
         add_to_frontier_fn(frontier, new_entries)
 
 
+def _invert(permutation: List[int]) -> List[int]:
+    """Invert a gid permutation.
+
+    ``permutation[old_gid] == new_gid``; the result satisfies
+    ``result[new_gid] == old_gid``.
+    """
+    inverse = [0] * len(permutation)
+    for old_gid, new_gid in enumerate(permutation):
+        inverse[new_gid] = old_gid
+    return inverse
+
+
+def _reorder_cff(font: ttLib.TTFont, tag: str, new_glyph_order: List[str]):
+    """Reorder the glyph-indexed data of a CFF or CFF2 table.
+
+    The charset, the CharStrings INDEX (or dict) and, for CID-keyed fonts,
+    the FDSelect all parallel the glyph order and must stay in sync. In
+    particular FDSelect maps a *glyph index* to a FontDict, so it has to be
+    permuted even though the CharStrings themselves are name keyed.
+    """
+    cff = font[tag].cff
+    for top_dict in cff.topDictIndex:
+        charstrings = top_dict.CharStrings
+
+        # A font read from XML initially has no charset; the CharStrings
+        # dict is then the source of truth for the current order.
+        charset = getattr(top_dict, "charset", None)
+        old_glyph_order = (
+            list(charset) if charset is not None else list(charstrings.charStrings)
+        )
+        if old_glyph_order == new_glyph_order:
+            continue
+
+        glyph_to_new_gid = {name: i for i, name in enumerate(new_glyph_order)}
+        # old_gid -> new_gid
+        permutation = [glyph_to_new_gid[name] for name in old_glyph_order]
+        # new_gid -> old_gid, used to lay out arrays that follow the glyphs.
+        inverse = _invert(permutation)
+
+        if hasattr(top_dict, "FDSelect"):
+            fd_select = top_dict.FDSelect
+            old_gid_array = list(fd_select.gidArray)
+            if len(old_gid_array) == len(permutation):
+                # Binary-read font: the array is fully populated and indexed by
+                # glyph id. Each glyph keeps its FD, so the value at a glyph's
+                # new gid is whatever its old gid pointed to.
+                fd_select.gidArray = [old_gid_array[old_gid] for old_gid in inverse]
+            else:
+                # XML-read font: gidArray is empty and the FD assignment
+                # lives on each (name-keyed) charstring as fdSelectIndex.
+                # The CFF compiler rebuilds the array by walking the charset,
+                # so reordering the charstrings below is sufficient.
+                assert len(old_gid_array) == 0
+
+        if charstrings.charStringsAreIndexed:
+            # Binary-read font: charStrings maps glyph names to indices into
+            # charStringsIndex. Physically reorder the INDEX so that position
+            # i holds the charstring of the glyph now at gid i.
+            index = charstrings.charStringsIndex
+            # The INDEX is lazily read: untouched slots are None and get read
+            # on demand through offsets that still point at their original
+            # positions. Materialize every item before permuting so nothing is
+            # resolved through a stale offset afterwards (the compiled bytes
+            # and the per-FD Private dict are retained). The offsets are
+            # recomputed from the items when the font is saved.
+            old_items = [index[i] for i in range(len(index))]
+            index.items = [old_items[old_gid] for old_gid in inverse]
+            index.offsets = []
+            charstrings.charStrings = {
+                name: new_gid for new_gid, name in enumerate(new_glyph_order)
+            }
+        else:
+            # XML-read font: charStrings maps glyph names to T2CharString
+            # objects, which carry their own fdSelectIndex.
+            old_charstrings = charstrings.charStrings
+            charstrings.charStrings = {
+                name: old_charstrings[name] for name in new_glyph_order
+            }
+
+        top_dict.charset = new_glyph_order
+
+
 def reorderGlyphs(font: ttLib.TTFont, new_glyph_order: List[str]):
     old_glyph_order = font.getGlyphOrder()
     if len(new_glyph_order) != len(old_glyph_order):
@@ -276,9 +358,4 @@ def reorderGlyphs(font: ttLib.TTFont, new_glyph_order: List[str]):
 
     for tag in ["CFF ", "CFF2"]:
         if tag in font:
-            cff_table = font[tag]
-            charstrings = cff_table.cff.topDictIndex[0].CharStrings.charStrings
-            cff_table.cff.topDictIndex[0].charset = new_glyph_order
-            cff_table.cff.topDictIndex[0].CharStrings.charStrings = {
-                k: charstrings.get(k) for k in new_glyph_order
-            }
+            _reorder_cff(font, tag, new_glyph_order)

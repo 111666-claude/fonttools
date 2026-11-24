@@ -1,3 +1,12 @@
+Unreleased
+----------
+
+- [ttLib] Reordering glyphs in a CFF/CFF2 font now keeps the ``FDSelect`` table
+  and the CharStrings INDEX in sync with the new glyph order. Previously the
+  CharStrings were reordered while ``FDSelect`` kept pointing at FontDicts by
+  the old glyph ids, so glyphs in a multi-FontDict CID font could be drawn with
+  another FontDict's Private dict, changing their outlines and widths.
+
 4.66.1 (released 2026-09-29)
 ----------------------------
 
