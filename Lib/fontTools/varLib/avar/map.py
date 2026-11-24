@@ -20,13 +20,25 @@ def map(
     if unknownAxes:
         raise ValueError(f"Unknown axis tag(s): {', '.join(unknownAxes)}")
 
-    if not inputNormalized:
+    # Fill in omitted axes with their default value: the fvar default for
+    # user-space coordinates, 0 for already-normalized coordinates. This way
+    # a sparse or empty location denotes the same default position as a fully
+    # specified one.
+    if inputNormalized:
+        location = {tag: location.get(tag, 0.0) for tag in axes}
+    else:
         location = {
-            tag: normalizeValue(value, axes[tag]) for tag, value in location.items()
+            tag: normalizeValue(location.get(tag, triple[1]), triple)
+            for tag, triple in axes.items()
         }
 
     if "avar" in font:
-        location = font["avar"].renormalizeLocation(location, font, dropZeroes)
+        location = font["avar"].renormalizeLocation(location, font, dropZeroes=False)
+
+    # Axes left at the default (0 in normalized space) are omitted from the
+    # output only when explicitly requested, uniformly for avar1 and avar2.
+    if dropZeroes:
+        location = {tag: value for tag, value in location.items() if value != 0}
 
     if not outputNormalized:
         location = {
@@ -55,7 +67,9 @@ def main(args=None):
     parser.add_argument(
         "coords",
         metavar="[AXIS=value...]",
-        help="Coordinates to map, e.g. 'wght=700 wdth=75'.",
+        help="Coordinates to map, e.g. 'wght=700 wdth=75'. "
+        "Omitted axes default to their fvar default (or 0 with -i); "
+        "no coordinates maps the default instance.",
         nargs="*",
         default=None,
     )
@@ -70,11 +84,6 @@ def main(args=None):
     )
 
     options = parser.parse_args(args)
-
-    if not options.coords:
-        parser.error(
-            "No coordinates provided. Please specify at least one axis coordinate (e.g., wght=500)"
-        )
 
     if options.font.endswith(".designspace"):
         from .build import build

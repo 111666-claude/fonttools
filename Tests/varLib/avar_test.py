@@ -143,6 +143,193 @@ def test_map_rejects_unknown_axis():
         map_avar(font, {"wdth": 100})
 
 
+# Fixed axis table shared by the default-position tests below: two visible
+# axes plus a hidden one, with a non-identity avar1 segment on "wght".
+FIXED_AXES = [
+    # tag, min, default, max, flags
+    ("wght", 100, 400, 900, 0),
+    ("wdth", 50, 100, 125, 0),
+    ("XXXX", 0, 0, 1, 0x0002),  # hidden axis
+]
+FIXED_DEFAULT_LOCATION = {"wght": 400.0, "wdth": 100.0, "XXXX": 0.0}
+
+AVAR2_TEST_FONT = os.path.join(
+    os.path.abspath(os.path.dirname(__file__)),
+    "..",
+    "ttLib",
+    "tables",
+    "data",
+    "Amstelvar-avar2.subset.ttf",
+)
+
+
+def make_fixed_axis_font():
+    font = TTFont()
+    fvar = newTable("fvar")
+    fvar.axes = []
+    for tag, minValue, defaultValue, maxValue, flags in FIXED_AXES:
+        axis = Axis()
+        axis.axisTag = tag
+        axis.axisNameID = 256
+        axis.minValue = minValue
+        axis.defaultValue = defaultValue
+        axis.maxValue = maxValue
+        axis.flags = flags
+        fvar.axes.append(axis)
+    font["fvar"] = fvar
+    avar = newTable("avar")
+    avar.segments = {
+        "wght": {-1.0: -1.0, 0.0: 0.0, 0.5: 0.7, 1.0: 1.0},
+        "wdth": {-1.0: -1.0, 0.0: 0.0, 1.0: 1.0},
+        "XXXX": {-1.0: -1.0, 0.0: 0.0, 1.0: 1.0},
+    }
+    font["avar"] = avar
+    return font
+
+
+def test_map_default_position_empty_sparse_and_full_input():
+    # Empty, sparse and full inputs all denote the same default position,
+    # in user coordinates as well as in normalized coordinates; omitted
+    # axes (including hidden ones) are filled with their defaults.
+    font = make_fixed_axis_font()
+    expected = dict(FIXED_DEFAULT_LOCATION)
+
+    assert map_avar(font, {}) == expected
+    assert map_avar(font, {}, inputNormalized=True) == expected
+    assert map_avar(font, {"wght": 400}) == expected
+    assert map_avar(font, {"wght": 0}, inputNormalized=True) == expected
+    assert map_avar(font, dict(FIXED_DEFAULT_LOCATION)) == expected
+    assert map_avar(font, {"wght": 0, "wdth": 0, "XXXX": 0}, inputNormalized=True) == (
+        expected
+    )
+
+
+def test_map_default_position_normalized_output():
+    font = make_fixed_axis_font()
+    expected = {"wght": 0.0, "wdth": 0.0, "XXXX": 0.0}
+
+    assert map_avar(font, {}, outputNormalized=True) == expected
+    assert map_avar(font, {}, inputNormalized=True, outputNormalized=True) == expected
+
+
+def test_map_dropZeroes_only_when_requested():
+    font = make_fixed_axis_font()
+
+    # Zero values are kept by default ...
+    assert map_avar(font, {}) == dict(FIXED_DEFAULT_LOCATION)
+    # ... and omitted only under the explicit option, for empty and
+    # sparse input alike.
+    assert map_avar(font, {}, dropZeroes=True) == {}
+    assert map_avar(font, {"wght": 400}, dropZeroes=True) == {}
+    assert map_avar(font, {"wght": 650}, dropZeroes=True) == {"wght": 750.0}
+
+
+def test_map_non_default_positions_unchanged():
+    # Filling defaults must not alter the mapping of non-default positions:
+    # wght=650 normalizes to 0.5, which the avar segment maps to 0.7,
+    # denormalizing to 750.
+    font = make_fixed_axis_font()
+
+    assert map_avar(font, {"wght": 650}) == {
+        "wght": 750.0,
+        "wdth": 100.0,
+        "XXXX": 0.0,
+    }
+    assert map_avar(font, {"wght": 0.5}, inputNormalized=True) == {
+        "wght": 750.0,
+        "wdth": 100.0,
+        "XXXX": 0.0,
+    }
+    assert map_avar(font, {"wght": 650}, outputNormalized=True) == {
+        "wght": 0.7,
+        "wdth": 0.0,
+        "XXXX": 0.0,
+    }
+
+
+def test_map_default_position_avar2():
+    # avar2 fonts follow the same default-position semantics as avar1.
+    font = TTFont(AVAR2_TEST_FONT)
+    expected = {a.axisTag: float(a.defaultValue) for a in font["fvar"].axes}
+
+    assert map_avar(font, {}) == expected
+    assert map_avar(font, {}, inputNormalized=True) == expected
+    assert map_avar(font, {"wght": 400}) == expected
+    assert map_avar(font, expected) == expected
+    assert map_avar(font, {}, dropZeroes=True) == {}
+
+
+def parse_cli_output(output):
+    location = {}
+    for line in output.splitlines():
+        tag, sep, value = line.partition("=")
+        assert sep
+        location[tag] = float(value)
+    return location
+
+
+def test_map_main_matches_library(tmp_path, capsys):
+    font = make_fixed_axis_font()
+    font_path = tmp_path / "Test.ttf"
+    font.save(font_path)
+    # Reload so the library result goes through the same F2Dot14
+    # quantization of the avar segments as the CLI's font.
+    font = TTFont(font_path)
+
+    # Empty input: CLI and library agree on the default position.
+    # (The CLI prints with %g precision, so compare approximately.)
+    map_main([str(font_path), "-f"])
+    assert parse_cli_output(capsys.readouterr().out) == pytest.approx(
+        map_avar(font, {})
+    )
+
+    # Without -f, default-position zeroes are omitted.
+    map_main([str(font_path)])
+    assert capsys.readouterr().out == ""
+
+    # Sparse and full input, user and normalized coordinates.
+    for args, location, kwargs in [
+        (["wght=650"], {"wght": 650}, {}),
+        (["wght=650", "wdth=100", "XXXX=0"], {"wght": 650}, {}),
+        (["-i", "-o", "wght=0.5"], {"wght": 0.5}, {"inputNormalized": True}),
+    ]:
+        map_main([str(font_path), "-f"] + args)
+        assert parse_cli_output(capsys.readouterr().out) == pytest.approx(
+            map_avar(font, location, outputNormalized="-o" in args, **kwargs)
+        )
+
+
+def test_map_default_position_avar2_cli(capsys):
+    font = TTFont(AVAR2_TEST_FONT)
+
+    map_main([AVAR2_TEST_FONT, "-f"])
+    assert parse_cli_output(capsys.readouterr().out) == pytest.approx(map_avar(font, {}))
+
+
+def test_map_default_location_instantiates_default_outlines():
+    # Instantiating at the mapped default location must reproduce the
+    # font's default outlines, however the location was specified.
+    from fontTools.varLib.instancer import instantiateVariableFont
+
+    mapped = map_avar(TTFont(AVAR2_TEST_FONT), {})
+    assert mapped == map_avar(TTFont(AVAR2_TEST_FONT), {"wght": 400})
+
+    inst = instantiateVariableFont(TTFont(AVAR2_TEST_FONT), mapped)
+    default = TTFont(AVAR2_TEST_FONT)
+
+    for glyph_name in default.getGlyphOrder():
+        g_default = default["glyf"][glyph_name]
+        g_inst = inst["glyf"][glyph_name]
+        if hasattr(g_default, "coordinates"):
+            assert list(g_inst.coordinates) == list(g_default.coordinates)
+        else:
+            assert g_inst.isComposite() == g_default.isComposite()
+            if g_default.isComposite():
+                assert [
+                    (c.glyphName, c.x, c.y) for c in g_inst.components
+                ] == [(c.glyphName, c.x, c.y) for c in g_default.components]
+
+
 def test_map_main_rejects_malformed_coordinate(tmp_path):
     designspace = Path(tmp_path) / "Test.designspace"
     designspace.write_text(
