@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import traceback
+from contextlib import contextmanager
 from io import BytesIO, StringIO, UnsupportedOperation
 from typing import TYPE_CHECKING, TypedDict, TypeVar, overload
 
@@ -22,7 +23,7 @@ from fontTools.ttLib.ttGlyphSet import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, MutableMapping
+    from collections.abc import Callable, Generator, Mapping, MutableMapping
     from types import ModuleType, TracebackType
     from typing import Any, BinaryIO, Literal, Sequence, TextIO
 
@@ -358,46 +359,49 @@ class TTFont(object):
         if not hasattr(file, "write"):
             if self.lazy and self.reader.file.name == file:
                 raise TTLibError("Can't overwrite TTFont when 'lazy' attribute is True")
-            createStream = True
-        else:
-            # assume "file" is a writable file object
-            createStream = False
 
+        # Stage 1: serialize the whole font into an in-memory spool, so the
+        # destination never needs to be seekable and a failed save never
+        # reaches the caller's stream at all.
         tmp = BytesIO()
+        try:
+            writer_reordersTables = self._save(tmp)
 
-        writer_reordersTables = self._save(tmp)
+            # Stage 2 (optional): rewrite the spool with a different table order.
+            if not (
+                reorderTables is None
+                or writer_reordersTables
+                or (reorderTables is False and self.reader is None)
+            ):
+                if reorderTables is False:
+                    # sort tables using the original font's order
+                    if self.reader is None:
+                        raise TTLibError(
+                            "The original table order is unavailable because there isn't a font to read it from."
+                        )
+                    tableOrder = list(self.reader.keys())
+                else:
+                    # use the recommended order from the OpenType specification
+                    tableOrder = None
+                tmp.flush()
+                tmp2 = BytesIO()
+                try:
+                    reorderFontTables(tmp, tmp2, tableOrder)
+                except BaseException:
+                    tmp2.close()
+                    raise
+                finally:
+                    tmp.close()
+                tmp = tmp2
 
-        if not (
-            reorderTables is None
-            or writer_reordersTables
-            or (reorderTables is False and self.reader is None)
-        ):
-            if reorderTables is False:
-                # sort tables using the original font's order
-                if self.reader is None:
-                    raise TTLibError(
-                        "The original table order is unavailable because there isn't a font to read it from."
-                    )
-                tableOrder = list(self.reader.keys())
-            else:
-                # use the recommended order from the OpenType specification
-                tableOrder = None
-            tmp.flush()
-            tmp2 = BytesIO()
-            reorderFontTables(tmp, tmp2, tableOrder)
+            # Stage 3: hand the finished bytes to the destination. The context
+            # manager owns the closing policy: a stream opened by the library
+            # (path argument) is always closed; a caller-supplied stream is
+            # never closed and receives a single write.
+            with _open_save_target(file) as target:
+                target.write(tmp.getvalue())
+        finally:
             tmp.close()
-            tmp = tmp2
-
-        if createStream:
-            # "file" is a path
-            assert isinstance(file, (str, os.PathLike))
-            with open(file, "wb") as file:
-                file.write(tmp.getvalue())
-        else:
-            assert not isinstance(file, (str, os.PathLike))
-            file.write(tmp.getvalue())
-
-        tmp.close()
 
     def _save(
         self,
@@ -1393,6 +1397,76 @@ class TTFont(object):
         from .reorderGlyphs import reorderGlyphs
 
         reorderGlyphs(self, new_glyph_order)
+
+
+@contextmanager
+def _open_save_target(
+    file: str | os.PathLike[str] | BinaryIO,
+) -> Generator[BinaryIO, None, None]:
+    """Resolve a ``save()`` destination to a writable stream.
+
+    This is the boundary at which stream ownership is decided:
+
+    - If ``file`` is a path, the library opens it and is responsible for
+      closing it, whether the body succeeds or raises. The file is opened only
+      once the caller reaches this boundary, so a failure while serializing
+      into the in-memory spool leaves the destination path untouched.
+    - If ``file`` already has a ``write`` method it is a caller-owned stream:
+      it is handed back untouched and is never closed by the library. The
+      body is expected to perform a single write of the fully serialized
+      bytes, which keeps unseekable streams (pipes, sockets) working.
+    """
+    if hasattr(file, "write"):
+        # caller-owned stream: ownership stays with the caller
+        yield file  # type: ignore[misc]
+        return
+    # library-owned stream: we open it and must always close it
+    with open(file, "wb") as stream:
+        yield stream
+
+
+@contextmanager
+def _spooled_save_target(
+    file: str | os.PathLike[str] | BinaryIO,
+) -> Generator[tuple[BinaryIO, Callable[[], None]], None, None]:
+    """Provide a seekable working stream plus a commit callback for ``save()``.
+
+    Serialization (which seeks while building the table directory) happens on
+    the yielded working stream; the caller must invoke the commit callback
+    once serialization has finished successfully. On any exception -- or when
+    the context is left without committing -- nothing is written to the
+    caller's destination and every stream the library opened gets closed.
+
+    Ownership rules:
+
+    - Path destination: the file is opened by the library up front and closed
+      on context exit in all cases; commit flushes the spooled bytes into it.
+      A failed save therefore leaves a (possibly truncated) file behind, which
+      has always been the observable behavior of :meth:`TTCollection.save`.
+    - Stream destination: the caller's stream is never closed or even touched
+      until commit; all work happens in a private :class:`BytesIO` spool, and
+      commit performs exactly one write of the complete output so unseekable
+      streams are supported.
+    """
+    if not hasattr(file, "write"):
+        # library-owned file: opened here, always closed here
+        stream = open(file, "wb")
+        try:
+            yield stream, stream.flush
+        finally:
+            stream.close()
+        return
+    # caller-owned stream: spool privately, commit with one write
+    spool = BytesIO()
+    destination: BinaryIO = file  # type: ignore[assignment]
+
+    def commit() -> None:
+        destination.write(spool.getvalue())
+
+    try:
+        yield spool, commit
+    finally:
+        spool.close()
 
 
 class GlyphOrder(object):

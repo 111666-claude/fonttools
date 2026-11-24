@@ -1,5 +1,4 @@
-from fontTools.ttLib.ttFont import TTFont
-from io import BytesIO
+from fontTools.ttLib.ttFont import TTFont, _spooled_save_target
 import struct
 import logging
 from contextlib import contextmanager
@@ -107,56 +106,52 @@ class TTCollection(object):
         the 'file' argument can be either a pathname or a writable
         file object.
         """
-        if not hasattr(file, "write"):
-            final = None
-            file = open(file, "wb")
-        else:
-            # assume "file" is a writable file object
-            # write to a temporary stream to allow saving to unseekable streams
-            final = file
-            file = BytesIO()
-
         tableCache = {} if shareTables else None
 
         # A V2 TTC will be saved if self.dsig is present, even if it is None
         version = TTC_V2 if hasattr(self, "dsig") else TTC_V1
 
-        # Pin one 'modified' timestamp so the fonts' 'head' tables can be shared.
-        with _sharedModifiedTimestamp(self.fonts):
-            offsets_offset = writeTTCHeader(file, len(self.fonts), version=version)
-            offsets = []
-            for font in self.fonts:
-                offsets.append(file.tell())
-                font._save(file, tableCache=tableCache)
-                file.seek(0, 2)
+        # The context manager owns the destination boundary: a path opens a
+        # library-owned file (always closed here, even on failure); a
+        # caller-supplied stream is spooled to privately and only receives a
+        # single write at commit time, which is what makes unseekable streams
+        # work. If anything below raises, commit() is never called and the
+        # caller's stream is left untouched.
+        with _spooled_save_target(file) as (out, commit):
+            # Pin one 'modified' timestamp so the fonts' 'head' tables can be shared.
+            with _sharedModifiedTimestamp(self.fonts):
+                offsets_offset = writeTTCHeader(out, len(self.fonts), version=version)
+                offsets = []
+                for font in self.fonts:
+                    offsets.append(out.tell())
+                    font._save(out, tableCache=tableCache)
+                    out.seek(0, 2)
 
-        file.seek(offsets_offset)
-        file.write(struct.pack(">%dL" % len(self.fonts), *offsets))
+            out.seek(offsets_offset)
+            out.write(struct.pack(">%dL" % len(self.fonts), *offsets))
 
-        if version == TTC_V2 and self.dsig is not None:
-            # Compile the DSIG if necessary
-            if hasattr(self.dsig, "data"):
-                data = self.dsig.data
-            else:
-                data = self.dsig.compile(None)
-            # Write the DSIG tag, length, and offset
-            # We are at the offset where the DSIG header starts
-            dsig_header_fields_offset = file.tell()
-            # The DSIG data will be written to the end of the file, go there
-            file.seek(0, 2)
-            dsig_offset = file.tell()
-            # Write the actual data
-            file.write(data)
-            # Go back to the DSIG header
-            file.seek(dsig_header_fields_offset)
-            # Write the tag
-            file.write(b"DSIG")
-            # Write the length and offset
-            file.write(struct.pack(">2L", len(data), dsig_offset))
+            if version == TTC_V2 and self.dsig is not None:
+                # Compile the DSIG if necessary
+                if hasattr(self.dsig, "data"):
+                    data = self.dsig.data
+                else:
+                    data = self.dsig.compile(None)
+                # Write the DSIG tag, length, and offset
+                # We are at the offset where the DSIG header starts
+                dsig_header_fields_offset = out.tell()
+                # The DSIG data will be written to the end of the file, go there
+                out.seek(0, 2)
+                dsig_offset = out.tell()
+                # Write the actual data
+                out.write(data)
+                # Go back to the DSIG header
+                out.seek(dsig_header_fields_offset)
+                # Write the tag
+                out.write(b"DSIG")
+                # Write the length and offset
+                out.write(struct.pack(">2L", len(data), dsig_offset))
 
-        if final:
-            final.write(file.getvalue())
-        file.close()
+            commit()
 
     def saveXML(self, fileOrPath, newlinestr="\n", writeVersion=True, **kwargs):
         from fontTools.misc import xmlWriter

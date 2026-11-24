@@ -1,4 +1,4 @@
-import os
+import io
 from io import BytesIO
 from itertools import count
 from pathlib import Path
@@ -223,3 +223,120 @@ def test_roundtrip_ttc_dsig_decompile(lazy):
         "00 00 00 01"  # DSIG table version
         "00 00 00 00"  # numSignatures, flags
     )
+
+
+# ---------------------------------------------------------------------------
+# Stream ownership / write-boundary tests for TTCollection.save()
+# ---------------------------------------------------------------------------
+
+class _TrackingStream(io.BytesIO):
+    def __init__(self):
+        super().__init__()
+        self.close_count = 0
+        self.write_count = 0
+
+    def close(self):
+        self.close_count += 1
+        super().close()
+
+    def write(self, b):
+        self.write_count += 1
+        return super().write(b)
+
+
+class _NonSeekableStream:
+    def __init__(self):
+        self.chunks = []
+        self.closed = False
+
+    def write(self, b):
+        self.chunks.append(bytes(b))
+        return len(b)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_save_does_not_close_caller_stream():
+    ttc = TTCollection(TTX_DATA_DIR / "TestTTC.ttc")
+    stream = _TrackingStream()
+    ttc.save(stream)
+    assert stream.close_count == 0
+    assert stream.write_count == 1
+    assert len(stream.getvalue()) > 0
+    ttc.close()
+
+
+def test_save_failure_leaves_caller_stream_untouched_and_open():
+    ttc = TTCollection(TTX_DATA_DIR / "TestTTC.ttc")
+    ttc.dsig = table_D_S_I_G_("DSIG")  # missing fields -> KeyError on compile
+    stream = _TrackingStream()
+    with pytest.raises(KeyError):
+        ttc.save(stream)
+    assert stream.close_count == 0
+    assert stream.getvalue() == b""
+    ttc.close()
+
+
+def test_save_to_nonseekable_stream_single_write():
+    ttc = TTCollection(TTX_DATA_DIR / "TestTTC.ttc")
+    stream = _NonSeekableStream()
+    ttc.save(stream)
+    assert len(stream.chunks) == 1
+    assert not stream.closed
+    ttc.close()
+
+
+def test_save_path_closes_library_opened_file_on_failure(tmp_path, monkeypatch):
+    # Regression test: when saving to a path, the file the library opens must
+    # be closed even if serialization raises. Previously the fd leaked.
+    import builtins
+
+    target = tmp_path / "fail.ttc"
+    opened = []
+    real_open = builtins.open
+
+    def tracking_open(file, *args, **kwargs):
+        f = real_open(file, *args, **kwargs)
+        if str(file) == str(target):
+            opened.append(f)
+        return f
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+
+    ttc = TTCollection(TTX_DATA_DIR / "TestTTC.ttc")
+    ttc.dsig = table_D_S_I_G_("DSIG")  # compile raises KeyError
+    with pytest.raises(KeyError):
+        ttc.save(target)
+
+    assert len(opened) == 1
+    assert opened[0].closed
+    # A truncated destination is the pre-existing observable behavior.
+    assert target.exists()
+    ttc.close()
+
+
+def test_save_path_success_closes_library_opened_file(tmp_path, monkeypatch):
+    import builtins
+
+    target = tmp_path / "ok.ttc"
+    opened = []
+    real_open = builtins.open
+
+    def tracking_open(file, *args, **kwargs):
+        f = real_open(file, *args, **kwargs)
+        if str(file) == str(target):
+            opened.append(f)
+        return f
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+
+    ttc = TTCollection(TTX_DATA_DIR / "TestTTC.ttc")
+    ttc.save(target)
+    assert len(opened) == 1
+    assert opened[0].closed
+    assert target.exists()
+    ttc.close()

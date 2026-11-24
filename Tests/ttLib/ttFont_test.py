@@ -368,3 +368,112 @@ def test_saveXML_skipTables():
     xml = out.getvalue()
     assert "<head>" not in xml
     assert "<hhea>" in xml
+
+
+# ---------------------------------------------------------------------------
+# Stream ownership / write-boundary tests for TTFont.save()
+# ---------------------------------------------------------------------------
+
+class _TrackingStream(io.BytesIO):
+    """BytesIO that records close() calls and the number of write() calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.close_count = 0
+        self.write_count = 0
+
+    def close(self):
+        self.close_count += 1
+        super().close()
+
+    def write(self, b):
+        self.write_count += 1
+        return super().write(b)
+
+
+class _NonSeekableStream:
+    """Write-only destination without seek/tell (pipe/socket analogue)."""
+
+    def __init__(self):
+        self.chunks = []
+        self.closed = False
+
+    def write(self, b):
+        self.chunks.append(bytes(b))
+        return len(b)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _BoomTable(DefaultTable):
+    def compile(self, ttFont):
+        raise ValueError("boom from compile")
+
+
+def test_save_does_not_close_caller_stream():
+    font = TTFont()
+    font.importXML(os.path.join(DATA_DIR, "TestTTF-Regular.ttx"))
+    stream = _TrackingStream()
+    font.save(stream)
+    assert stream.close_count == 0
+    assert stream.write_count == 1  # whole font committed in one write
+    assert len(stream.getvalue()) > 0
+    font.close()
+
+
+def test_save_failure_leaves_caller_stream_untouched_and_open():
+    font = TTFont()
+    font.importXML(os.path.join(DATA_DIR, "TestTTF-Regular.ttx"))
+    font.tables["name"] = _BoomTable("name")
+    stream = _TrackingStream()
+    with pytest.raises(ValueError, match="boom"):
+        font.save(stream)
+    assert stream.close_count == 0
+    assert stream.getvalue() == b""
+    font.close()
+
+
+def test_save_failure_to_path_does_not_create_target(tmp_path):
+    # The destination file is opened only after serialization succeeds, so a
+    # failing save must leave the path untouched.
+    font = TTFont()
+    font.importXML(os.path.join(DATA_DIR, "TestTTF-Regular.ttx"))
+    font.tables["name"] = _BoomTable("name")
+    target = tmp_path / "never.ttf"
+    with pytest.raises(ValueError, match="boom"):
+        font.save(target)
+    assert not target.exists()
+    font.close()
+
+
+def test_save_to_nonseekable_stream_single_write():
+    font = TTFont()
+    font.importXML(os.path.join(DATA_DIR, "TestTTF-Regular.ttx"))
+    for reorderTables in (True, False, None):
+        stream = _NonSeekableStream()
+        font.save(stream, reorderTables=reorderTables)
+        assert len(stream.chunks) == 1
+        assert not stream.closed
+    font.close()
+
+
+def test_save_path_closes_library_stream_even_on_failure(tmp_path):
+    # Regression: temporary spools must not leak; no ResourceWarning and the
+    # library-opened destination is handled by a context manager.
+    import gc
+    import warnings
+
+    font = TTFont()
+    font.importXML(os.path.join(DATA_DIR, "TestTTF-Regular.ttx"))
+    target = tmp_path / "ok.ttf"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        font.save(target)
+        gc.collect()
+    assert not any(issubclass(w.category, ResourceWarning) for w in caught)
+    assert target.exists()
+    font.close()
