@@ -320,7 +320,14 @@ class TTFont(object):
         elif not seekable:
             raise TTLibError("Input file must be seekable when lazy=True")
         self._tableCache = _tableCache
-        self.reader = SFNTReader(file, checkChecksums, fontNumber=fontNumber)
+        try:
+            self.reader = SFNTReader(file, checkChecksums, fontNumber=fontNumber)
+        except BaseException:
+            # SFNTReader can raise (e.g. TTLibFileIsCollectionError) after we
+            # opened the file above; make sure we don't leak it on the way out.
+            if closeStream:
+                file.close()
+            raise
         self.sfntVersion = self.reader.sfntVersion
         self.flavor = self.reader.flavor
         self.flavorData = self.reader.flavorData

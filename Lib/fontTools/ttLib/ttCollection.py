@@ -1,5 +1,7 @@
+from fontTools.ttLib import TTLibError
 from fontTools.ttLib.ttFont import TTFont
 from io import BytesIO
+import os
 import struct
 import logging
 from contextlib import contextmanager
@@ -73,16 +75,25 @@ class TTCollection(object):
         tableCache = {} if shareTables else None
 
         header = readTTCHeader(file)
-        for i in range(header.numFonts):
-            font = TTFont(file, fontNumber=i, _tableCache=tableCache, **kwargs)
-            fonts.append(font)
+        try:
+            for i in range(header.numFonts):
+                font = TTFont(file, fontNumber=i, _tableCache=tableCache, **kwargs)
+                fonts.append(font)
 
-        if header.Version == TTC_V2:
-            self.dsig: table_D_S_I_G_ | None = None
-            if header.ulDsigOffset != 0:
-                self.dsig = table_D_S_I_G_("DSIG")
-                file.seek(header.ulDsigOffset, 0)
-                self.dsig.data = file.read(header.ulDsigLength)
+            if header.Version == TTC_V2:
+                self.dsig: table_D_S_I_G_ | None = None
+                if header.ulDsigOffset != 0:
+                    self.dsig = table_D_S_I_G_("DSIG")
+                    file.seek(header.ulDsigOffset, 0)
+                    self.dsig.data = file.read(header.ulDsigLength)
+        except BaseException:
+            # A malformed member must not leak the collection file or the
+            # member fonts already constructed before the failure.
+            for font in fonts:
+                font.close()
+            if closeStream:
+                file.close()
+            raise
 
         # don't close file if lazy=True, as the TTFont hold a reference to the original
         # file; the file will be closed once the TTFonts are closed in the
@@ -116,47 +127,68 @@ class TTCollection(object):
             final = file
             file = BytesIO()
 
-        tableCache = {} if shareTables else None
+        try:
+            tableCache = {} if shareTables else None
 
-        # A V2 TTC will be saved if self.dsig is present, even if it is None
-        version = TTC_V2 if hasattr(self, "dsig") else TTC_V1
+            # A V2 TTC will be saved if self.dsig is present, even if it is None
+            version = TTC_V2 if hasattr(self, "dsig") else TTC_V1
 
-        # Pin one 'modified' timestamp so the fonts' 'head' tables can be shared.
-        with _sharedModifiedTimestamp(self.fonts):
-            offsets_offset = writeTTCHeader(file, len(self.fonts), version=version)
-            offsets = []
-            for font in self.fonts:
-                offsets.append(file.tell())
-                font._save(file, tableCache=tableCache)
+            # Pin one 'modified' timestamp so the fonts' 'head' tables can be shared.
+            with _sharedModifiedTimestamp(self.fonts):
+                offsets_offset = writeTTCHeader(file, len(self.fonts), version=version)
+                offsets = []
+                for fontIndex, font in enumerate(self.fonts):
+                    offsets.append(file.tell())
+                    try:
+                        font._save(file, tableCache=tableCache)
+                    except Exception as e:
+                        raise TTLibError(
+                            f"Failed to save font #{fontIndex} of {len(self.fonts)} "
+                            f"in collection: {e}"
+                        ) from e
+                    file.seek(0, 2)
+
+            file.seek(offsets_offset)
+            file.write(struct.pack(">%dL" % len(self.fonts), *offsets))
+
+            if version == TTC_V2 and self.dsig is not None:
+                # Compile the DSIG if necessary
+                if hasattr(self.dsig, "data"):
+                    data = self.dsig.data
+                else:
+                    data = self.dsig.compile(None)
+                # Write the DSIG tag, length, and offset
+                # We are at the offset where the DSIG header starts
+                dsig_header_fields_offset = file.tell()
+                # The DSIG data will be written to the end of the file, go there
                 file.seek(0, 2)
+                dsig_offset = file.tell()
+                # Write the actual data
+                file.write(data)
+                # Go back to the DSIG header
+                file.seek(dsig_header_fields_offset)
+                # Write the tag
+                file.write(b"DSIG")
+                # Write the length and offset
+                file.write(struct.pack(">2L", len(data), dsig_offset))
 
-        file.seek(offsets_offset)
-        file.write(struct.pack(">%dL" % len(self.fonts), *offsets))
-
-        if version == TTC_V2 and self.dsig is not None:
-            # Compile the DSIG if necessary
-            if hasattr(self.dsig, "data"):
-                data = self.dsig.data
-            else:
-                data = self.dsig.compile(None)
-            # Write the DSIG tag, length, and offset
-            # We are at the offset where the DSIG header starts
-            dsig_header_fields_offset = file.tell()
-            # The DSIG data will be written to the end of the file, go there
-            file.seek(0, 2)
-            dsig_offset = file.tell()
-            # Write the actual data
-            file.write(data)
-            # Go back to the DSIG header
-            file.seek(dsig_header_fields_offset)
-            # Write the tag
-            file.write(b"DSIG")
-            # Write the length and offset
-            file.write(struct.pack(">2L", len(data), dsig_offset))
-
-        if final:
-            final.write(file.getvalue())
-        file.close()
+            if final:
+                final.write(file.getvalue())
+        except BaseException:
+            # A failed save must not leave a half-written collection behind
+            # when we opened the output path ourselves.
+            if final is None:
+                file.close()
+                try:
+                    os.remove(file.name)
+                except OSError:
+                    pass
+            raise
+        finally:
+            # A stream handed in by the caller stays its owner's
+            # responsibility; only close the one we opened ourselves.
+            if final is None and not file.closed:
+                file.close()
 
     def saveXML(self, fileOrPath, newlinestr="\n", writeVersion=True, **kwargs):
         from fontTools.misc import xmlWriter
