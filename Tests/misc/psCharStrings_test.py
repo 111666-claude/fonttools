@@ -2,6 +2,8 @@ from fontTools.cffLib import PrivateDict
 from fontTools.cffLib.specializer import stringToProgram
 from fontTools.misc.testTools import getXML, parseXML
 from fontTools.misc.psCharStrings import (
+    CharStringCompileError,
+    T1CharString,
     T2CharString,
     encodeFloat,
     encodeFixed,
@@ -332,3 +334,91 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(unittest.main())
+
+
+@pytest.mark.parametrize("isCFF2", [False, True])
+@pytest.mark.parametrize(
+    "operator, token", [(b"\x02", "unknown_2"), (b"\x0c\x28", "unknown_12_40")]
+)
+def test_t2_unknown_operator(operator, token, isCFF2):
+    # An undefined operator must not end the charstring: the rest of the glyph
+    # (operands and following drawing operators) has to survive both drawing
+    # and a bytecode -> program -> bytecode round trip.
+    private = PrivateDict()
+    if isCFF2:
+        private._isCFF2 = True
+        private.nominalWidthX = private.defaultWidthX = None
+    end = "" if isCFF2 else " endchar"
+    head = T2CharString(program=stringToProgram("0 0 rmoveto 100 0 rlineto"))
+    tail = T2CharString(program=stringToProgram("0 100 rlineto" + end))
+    head.compile(isCFF2=isCFF2)
+    tail.compile(isCFF2=isCFF2)
+    bytecode = head.bytecode + b"\x8c\x8d" + operator + tail.bytecode
+
+    cs = T2CharString(bytecode=bytecode, private=private)
+    pen = RecordingPen()
+    cs.draw(pen)
+    assert pen.value == [
+        ("moveTo", ((0, 0),)),
+        ("lineTo", ((100, 0),)),
+        ("lineTo", ((100, 100),)),
+        ("closePath", ()),
+    ]
+
+    cs = T2CharString(bytecode=bytecode, private=private)
+    cs.decompile()
+    assert cs.program[6:9] == [1, 2, token]
+    xml = getXML(cs.toXML)
+    assert token in " ".join(xml)
+    cs.compile(isCFF2=isCFF2)
+    assert cs.bytecode == bytecode
+
+    cs = T2CharString(private=private)
+    for name, attrs, content in parseXML(
+        ["<CharString>", " ".join(xml), "</CharString>"]
+    ):
+        cs.fromXML(name, attrs, content)
+    cs.compile(isCFF2=isCFF2)
+    assert cs.bytecode == bytecode
+
+
+def test_t1_unknown_operator():
+    head = T1CharString(program=[0, 500, "hsbw", 0, 0, "rmoveto"])
+    tail = T1CharString(program=[0, 100, "rlineto", "closepath", "endchar"])
+    head.compile()
+    tail.compile()
+    bytecode = head.bytecode + b"\x8c\x8d\x02" + tail.bytecode
+
+    cs = T1CharString(bytecode=bytecode)
+    pen = RecordingPen()
+    cs.draw(pen)
+    assert pen.value == [
+        ("moveTo", ((0, 0),)),
+        ("lineTo", ((0, 100),)),
+        ("closePath", ()),
+    ]
+
+    cs = T1CharString(bytecode=bytecode)
+    cs.decompile()
+    assert cs.program[6:9] == [1, 2, "unknown_2"]
+    cs.compile()
+    assert cs.bytecode == bytecode
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "bogus",
+        "unknown_1",  # a known T2 operator
+        "unknown_12",  # an escape prefix, not an operator
+        "unknown_12_0",  # a known escaped operator
+        "unknown_28",  # an operand, not an operator
+        "unknown_256",  # b1 out of range
+    ],
+)
+def test_unknown_operator_token_compile_error(token):
+    # Only tokens that denote an actually-undefined operator may be compiled;
+    # arbitrary text (or a token naming a known/non-operator opcode) must fail.
+    cs = T2CharString(program=[token])
+    with pytest.raises(CharStringCompileError, match="illegal operator"):
+        cs.compile()

@@ -1,8 +1,10 @@
 import unittest
 import os
 import sys
+import tempfile
 from fontTools import t1Lib
 from fontTools.pens.basePen import NullPen
+from fontTools.pens.recordingPen import RecordingPen
 from fontTools.misc.psCharStrings import T1CharString
 import random
 
@@ -143,6 +145,36 @@ class EditTest(unittest.TestCase):
         hinted_font = t1Lib.T1Font(ELLIPSIS_HINTED)
         hinted_font.parse()
         self.assertTrue(same_dicts(hinted_font.font, saved_font))
+
+    def test_edit_unknown_operator(self):
+        # An undefined operator (here 0x02) must not end the charstring: the
+        # path and the following instructions have to survive a save/reload.
+        glyphName = "ellipsis"
+        font = t1Lib.T1Font(PFB)
+        before = RecordingPen()
+        font.getGlyphSet()[glyphName].draw(before)
+        before = list(before.value)
+
+        glyph = font.getGlyphSet()[glyphName]
+        glyph.decompile()
+        program = list(glyph.program)
+        # Follow the hsbw with operands and an undefined operator.
+        hsbw = program.index("hsbw") + 1
+        program[hsbw:hsbw] = [1, 2, "unknown_2"]
+        glyph.program = program
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            save_path = os.path.join(tempdir, "temp.pfb")
+            font.saveAs(save_path, "PFB")
+            reloaded = t1Lib.T1Font(save_path)
+            reloaded_glyph = reloaded.getGlyphSet()[glyphName]
+            self.assertIn(b"\x8c\x8d\x02", reloaded_glyph.bytecode)
+            after = RecordingPen()
+            reloaded_glyph.draw(after)
+            self.assertEqual(list(after.value), before)
+
+            reloaded_glyph.decompile()
+            self.assertIn("unknown_2", reloaded_glyph.program)
 
     @staticmethod
     def write(font, outtype, dohex=False, doparse=False):

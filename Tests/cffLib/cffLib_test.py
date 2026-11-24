@@ -7,7 +7,9 @@ libdir = os.path.join(
 sys.path.insert(0, libdir)
 
 from fontTools.cffLib import TopDict, PrivateDict, CharStrings, CFFFontSet
-from fontTools.misc.testTools import parseXML, DataFilesHandler
+from fontTools.misc.psCharStrings import T2CharString
+from fontTools.misc.testTools import getXML, parseXML, DataFilesHandler
+from fontTools.pens.recordingPen import RecordingPen
 from fontTools.ttLib import TTFont
 import copy
 import unittest
@@ -194,6 +196,77 @@ class CffLibTest(DataFilesHandler):
         data.seek(0)
 
         self.assertEqual(TTFont(data)["CFF "].cff.fontNames, ["Caf\u00e9Sans"])
+
+    def test_unknown_operator_round_trip(self):
+        # Real fonts may contain operators whose opcode is defined but whose
+        # meaning the tool does not know (here bytes 0x02 and 0x0c 0x28 are
+        # undefined in Type 2). They must not end the charstring: both the
+        # drawing and the remaining operands/operators have to survive a
+        # decompile/recompile cycle, through binary as well as XML.
+        glyphName = "three.superior"
+        otherGlyphName = "A"
+
+        def draw(charString):
+            pen = RecordingPen()
+            charString.draw(pen)
+            return list(pen.value)
+
+        for operator, token in [(b"\x02", "unknown_2"), (b"\x0c\x28", "unknown_12_40")]:
+            with self.subTest(operator=operator):
+                font = TTFont(
+                    self.getpath("LinLibertine_RBI.otf"),
+                    recalcBBoxes=False,
+                    recalcTimestamp=False,
+                )
+                topDict = font["CFF "].cff.topDictIndex[0]
+                expectedPath = draw(topDict.CharStrings[glyphName])
+                expectedOtherPath = draw(topDict.CharStrings[otherGlyphName])
+
+                charString = topDict.CharStrings[glyphName]
+                charString.decompile()
+                program = list(charString.program)
+                # Put operands and the unknown operator between two known
+                # drawing operators, as happens in real broken-but-renderable
+                # charstrings.
+                program.insert(program.index("rrcurveto") + 1, 1)
+                program.insert(program.index("rrcurveto") + 2, 2)
+                program.insert(program.index("rrcurveto") + 3, token)
+                charString.setProgram(program)
+                charString.compile()
+                self.assertIn(operator, charString.bytecode)
+
+                # The unknown operator is skipped, the rest of the path is
+                # still drawn.
+                self.assertEqual(draw(charString), expectedPath)
+
+                # Binary round trip.
+                data = BytesIO()
+                font.save(data)
+                data.seek(0)
+                font2 = TTFont(data, recalcBBoxes=False, recalcTimestamp=False)
+                topDict2 = font2["CFF "].cff.topDictIndex[0]
+                charString2 = topDict2.CharStrings[glyphName]
+                self.assertIn(operator, charString2.bytecode)
+                bytecode2 = charString2.bytecode
+                # Drawing decompiles the charstring, so save the bytecode first.
+                self.assertEqual(draw(charString2), expectedPath)
+                self.assertEqual(
+                    draw(topDict2.CharStrings[otherGlyphName]), expectedOtherPath
+                )
+                charString2.decompile()
+                self.assertIn(token, charString2.program)
+
+                # XML round trip, starting from the decompiled charstring.
+                xml = getXML(charString2.toXML)
+                self.assertIn(token, " ".join(xml))
+                charString3 = T2CharString(private=charString2.private)
+                for name, attrs, content in parseXML(
+                    ["<CharString>", " ".join(xml), "</CharString>"]
+                ):
+                    charString3.fromXML(name, attrs, content)
+                charString3.compile()
+                self.assertEqual(charString3.bytecode, bytecode2)
+                self.assertEqual(draw(charString3), expectedPath)
 
 
 class CFFToCFF2Test(DataFilesHandler):
