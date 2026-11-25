@@ -243,6 +243,7 @@ ttLib.getTableClass("GDEF").mergeMap = ttLib.getTableClass("GSUB").mergeMap = (
 @add_method(ttLib.getTableClass("GSUB"))
 def merge(self, m, tables):
     assert len(tables) == len(m.duplicateGlyphsPerFont)
+    synthLookups = []
     for i, (table, dups) in enumerate(zip(tables, m.duplicateGlyphsPerFont)):
         if not dups:
             continue
@@ -309,7 +310,28 @@ def merge(self, m, tables):
                     feature.Feature.LookupListIndex[:0] = [synthLookup]
                     feature.Feature.LookupCount += 1
 
+        if synthLookup is not None:
+            synthLookups.append(synthLookup)
+
     DefaultTable.merge(self, m, tables)
+
+    if synthLookups:
+        # The synthesized 'locl' lookups replace glyphs that lost the cmap
+        # to another font with their renamed duplicates.  Other lookups
+        # (e.g. 'ccmp' chains or mark-positioning-related substitutions
+        # from the font the duplicates came from) only match those renamed
+        # glyphs, so the 'locl' substitutions must be applied first.
+        # GSUB lookups are applied in lookup-list order, hence move the
+        # synthesized lookups to the front of the merged lookup list.
+        # Cross-references are object references at this point (they are
+        # only turned back into indices in layoutPostMerge), so reordering
+        # the list is safe.
+        _, _, lookupList = _get_layout_lists(self)
+        if lookupList is not None:
+            synthIds = {id(l) for l in synthLookups}
+            lookupList.Lookup[:] = [
+                l for l in lookupList.Lookup if id(l) in synthIds
+            ] + [l for l in lookupList.Lookup if id(l) not in synthIds]
     return self
 
 

@@ -899,6 +899,195 @@ def test_merge_MATH():
     ] == ["minus"]
 
 
+def _make_latin_mark_fontfile(anchor_shift, ccmp_in_default_langsys=True):
+    """A Latin font with a combining mark, a 'ccmp' chain replacing 'i' with
+    'dotlessi' before above marks, and mark-to-base anchors.
+
+    anchor_shift differentiates the anchors of otherwise identical fonts so
+    that it is observable which font's anchors were applied.
+
+    With ccmp_in_default_langsys=False the GSUB feature is registered only
+    for a non-default langsys (like e.g. Noto Sans Tamil Supplement, whose
+    GSUB has no default langsys), so it does not take part in default
+    shaping and no synthesized 'locl' reroutes the default language to this
+    font's glyphs.
+    """
+    glyphOrder = [".notdef", "space", "A", "i", "dotlessi", "uni0305"]
+    cmap = {0x20: "space", 0x41: "A", 0x69: "i", 0x0305: "uni0305"}
+    glyphs = {gn: Glyph() for gn in glyphOrder}
+    hmtx = {gn: (500, 0) for gn in glyphOrder}
+    names = {"familyName": "TestMark", "styleName": "Regular"}
+
+    if ccmp_in_default_langsys:
+        ccmp_langsystems = "languagesystem DFLT dflt; languagesystem latn dflt;"
+        mark_langsystems = ""
+    else:
+        ccmp_langsystems = "languagesystem DFLT dflt; languagesystem latn ROM;"
+        mark_langsystems = "languagesystem latn dflt;"
+
+    fb = FontBuilder(unitsPerEm=1000)
+    fb.setupGlyphOrder(glyphOrder)
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(hmtx)
+    fb.setupHorizontalHeader()
+    fb.setupNameTable(names)
+    fb.setupOS2()
+    fb.setupPost()
+    addOpenTypeFeaturesFromString(
+        fb.font,
+        f"""
+        {ccmp_langsystems}
+        markClass uni0305 <anchor 0 400> @TOP_MARKS;
+        feature ccmp {{
+            sub i' [uni0305] by dotlessi;
+        }} ccmp;
+        {mark_langsystems}
+        feature mark {{
+            pos base A <anchor 300 {700 + anchor_shift}> mark @TOP_MARKS;
+            pos base i <anchor 150 {500 + anchor_shift}> mark @TOP_MARKS;
+            pos base dotlessi <anchor 150 {300 + anchor_shift}> mark @TOP_MARKS;
+        }} mark;
+        """,
+    )
+    return _compile(fb.font)
+
+
+def _make_other_script_fontfile():
+    """A font without any Latin glyphs, standing in for e.g. Noto Sans Tangsa."""
+    glyphOrder = [".notdef", "uni16A70", "uni16A71"]
+    cmap = {0x16A70: "uni16A70", 0x16A71: "uni16A71"}
+    glyphs = {gn: Glyph() for gn in glyphOrder}
+    hmtx = {gn: (500, 0) for gn in glyphOrder}
+    names = {"familyName": "TestOther", "styleName": "Regular"}
+
+    fb = FontBuilder(unitsPerEm=1000)
+    fb.setupGlyphOrder(glyphOrder)
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(hmtx)
+    fb.setupHorizontalHeader()
+    fb.setupNameTable(names)
+    fb.setupOS2()
+    fb.setupPost()
+    addOpenTypeFeaturesFromString(
+        fb.font,
+        """
+        languagesystem tnsa dflt;
+        feature kern {
+            pos uni16A70 uni16A71 -80;
+        } kern;
+        """,
+    )
+    return _compile(fb.font)
+
+
+def _shape_positions(fontfile, text, script=None):
+    hb = pytest.importorskip("uharfbuzz")
+    face = hb.Face(hb.Blob(fontfile.getvalue()))
+    font = hb.Font(face)
+    buf = hb.Buffer()
+    buf.add_str(text)
+    if script is not None:
+        buf.script = script
+    else:
+        buf.guess_segment_properties()
+    hb.shape(font, buf)
+    return [
+        (pos.x_offset, pos.y_offset, pos.x_advance, pos.y_advance)
+        for pos in buf.glyph_positions
+    ]
+
+
+def _mark_base_anchors(gpos):
+    """Maps (baseGlyph, markGlyph) -> ((baseX, baseY), (markX, markY))."""
+    anchors = {}
+    for lookup in gpos.LookupList.Lookup:
+        for subtable in lookup.SubTable:
+            if subtable is None:
+                continue
+            if lookup.LookupType == 9:  # ExtensionPos
+                subtable = subtable.ExtSubTable
+            markCoverage = getattr(subtable, "MarkCoverage", None)
+            baseCoverage = getattr(subtable, "BaseCoverage", None)
+            if markCoverage is None or baseCoverage is None:
+                continue
+            for markGlyph, markRecord in zip(
+                markCoverage.glyphs, subtable.MarkArray.MarkRecord
+            ):
+                markAnchor = markRecord.MarkAnchor
+                for baseGlyph, baseRecord in zip(
+                    baseCoverage.glyphs, subtable.BaseArray.BaseRecord
+                ):
+                    baseAnchor = baseRecord.BaseAnchor[markRecord.Class]
+                    anchors[(baseGlyph, markGlyph)] = (
+                        (baseAnchor.XCoordinate, baseAnchor.YCoordinate),
+                        (markAnchor.XCoordinate, markAnchor.YCoordinate),
+                    )
+    return anchors
+
+
+# https://github.com/fonttools/fonttools/issues/3407
+# Merging fonts whose glyphs duplicate another font's renames those glyphs and
+# routes them through a synthesized 'locl' lookup.  That lookup must apply
+# before the donor font's other lookups (e.g. 'ccmp' chains feeding mark
+# positioning), otherwise combining-mark positioning breaks.
+@pytest.mark.parametrize(
+    "order",
+    ["".join(p) for p in itertools.permutations("TSG")] + ["TS", "ST"],
+)
+def test_merge_preserves_combining_mark_positioning(order):
+    # 'T': Latin font with shifted anchors, wins the cmap when merged first.
+    # 'S': Latin font the expected shaping is taken from.
+    # 'G': font covering an unrelated script only.
+    fontfiles = {
+        "T": _make_latin_mark_fontfile(
+            anchor_shift=1000, ccmp_in_default_langsys=False
+        ),
+        "S": _make_latin_mark_fontfile(anchor_shift=0),
+        "G": _make_other_script_fontfile(),
+    }
+    merged = _merge_and_recompile([fontfiles[tag] for tag in order])
+
+    # The character map is unaffected: first font wins, no codepoints lost.
+    cmap = merged.getBestCmap()
+    assert cmap[0x41] == "A"
+    assert cmap[0x69] == "i"
+    assert cmap[0x0305] == "uni0305"
+    if "G" in order:
+        assert cmap[0x16A70] == "uni16A70"
+
+    # S's glyphs are renamed when T precedes it in the merge.
+    suffix = ".1" if order.index("S") > order.index("T") else ""
+
+    # Read back the merged GPOS: both fonts' anchors survive, each attached
+    # to its own (possibly renamed) glyphs.
+    anchors = _mark_base_anchors(merged["GPOS"].table)
+    assert anchors[("dotlessi" + suffix, "uni0305" + suffix)] == (
+        (150, 300),
+        (0, 400),
+    )
+    assert anchors[("i" + suffix, "uni0305" + suffix)] == ((150, 500), (0, 400))
+    t_suffix = ".1" if order.index("T") > order.index("S") else ""
+    assert anchors[("dotlessi" + t_suffix, "uni0305" + t_suffix)] == (
+        (150, 1300),
+        (0, 400),
+    )
+
+    # Shaping Latin text with combining marks matches the donor font,
+    # regardless of merge order.
+    for text in ("A̅", "i̅"):
+        assert _shape_positions(_compile(merged), text) == _shape_positions(
+            fontfiles["S"], text
+        )
+
+    # The unrelated script is shaped by its own font's lookups as before.
+    if "G" in order:
+        assert _shape_positions(
+            _compile(merged), "\U00016a70\U00016a71", script="tnsa"
+        ) == _shape_positions(fontfiles["G"], "\U00016a70\U00016a71", script="tnsa")
+
+
 if __name__ == "__main__":
     import sys
 

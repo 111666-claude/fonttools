@@ -1,3 +1,12 @@
+4.68.1 (unreleased)
+-------------------
+
+- [merge] Fix broken mark positioning when merging fonts whose glyphs duplicate
+  another font's: the synthesized ``locl`` lookups that map to the renamed
+  duplicate glyphs are now placed at the front of the merged GSUB lookup list,
+  so they apply before the donor font's other lookups (e.g. ``ccmp`` chains
+  feeding mark positioning) instead of after them (#3407).
+
 4.68.0 (released 2026-10-27)
 ----------------------------
 
