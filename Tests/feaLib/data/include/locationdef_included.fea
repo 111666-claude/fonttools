@@ -1,0 +1,3 @@
+# A named location defined inside an included file; the including file may
+# reference it because includes share the top-level scope.
+locationDef wght=900u @Heavy;

@@ -1554,6 +1554,79 @@ class BuilderTest(unittest.TestCase):
         assert self.get_region(var_region_axis_wght) == (0.0, 0.875, 1.0)
         assert self.get_region(var_region_axis_wdth) == (0.0, 0.5, 1.0)
 
+    def test_variable_scalar_named_location_matches_inline(self):
+        """A named location and the equivalent inline location must produce the
+        same built variation data, including after save/reload."""
+
+        named = """
+            locationDef wght=900u @Heavy;
+            feature kern {
+                pos two <0 (12 wght=400u:10 @Heavy:22) 0 0>;
+            } kern;
+        """
+        inline = """
+            feature kern {
+                pos two <0 (12 wght=400u:10 wght=900u:22) 0 0>;
+            } kern;
+        """
+        built = []
+        for features in (named, inline):
+            font = self.make_mock_vf()
+            addOpenTypeFeaturesFromString(font, features)
+            for tag in ("GDEF", "GSUB", "GPOS"):
+                if tag in font:
+                    data = font[tag].compile(font)
+                    font[tag].decompile(data, font)
+            regions = font["GDEF"].table.VarStore.VarRegionList.Region
+            built.append(
+                [
+                    [self.get_region(axis) for axis in region.VarRegionAxis]
+                    for region in regions
+                ]
+            )
+        self.assertEqual(built[0], built[1])
+        self.assertEqual(built[0][0][0], (0.0, 0.25, 1.0))
+
+    def test_variable_scalar_normalized_units(self):
+        """Normalized units (n) map onto the fvar min/max coordinates."""
+
+        features = """
+            feature kern {
+                pos two <0 (12 wght=1n:22) 0 0>;
+            } kern;
+        """
+        font = self.make_mock_vf()
+        addOpenTypeFeaturesFromString(font, features)
+        axis = font["GDEF"].table.VarStore.VarRegionList.Region[0].VarRegionAxis[0]
+        self.assertEqual(self.get_region(axis), (0.0, 1.0, 1.0))
+
+    def test_variable_scalar_designer_units_with_avar(self):
+        """Designer units (d) honor the avar mapping when normalized."""
+
+        features = """
+            feature kern {
+                pos two <0 (12 wght=600d:22) 0 0>;
+            } kern;
+        """
+        font = self.make_mock_vf()
+        font["avar"] = newTable("avar")
+        font["avar"].segments = {"wght": {-1.0: -1.0, 0.0: 0.0, 0.5: 0.625, 1.0: 1.0}}
+        addOpenTypeFeaturesFromString(font, features)
+        axis = font["GDEF"].table.VarStore.VarRegionList.Region[0].VarRegionAxis[0]
+        # wght=600 normalizes to 0.5 which avar shifts to 0.625.
+        self.assertEqual(self.get_region(axis), (0.0, 0.625, 1.0))
+
+    def test_variable_scalar_named_location_unknown_axis(self):
+        font = self.make_mock_vf()
+        features = """
+            locationDef wght=200u, slnt=0u @Weird;
+            feature kern {
+                pos two <0 (12 @Weird:22) 0 0>;
+            } kern;
+        """
+        with self.assertRaisesRegex(FeatureLibError, "Unknown axis slnt"):
+            addOpenTypeFeaturesFromString(font, features)
+
     def test_ligatureCaretByPos_variable_scalar(self):
         """Test that the `avar` table is consulted when normalizing user-space
         values."""

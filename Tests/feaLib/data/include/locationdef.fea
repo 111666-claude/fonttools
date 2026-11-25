@@ -1,0 +1,4 @@
+include(locationdef_included.fea);
+feature kern {
+    pos a (0 @Heavy:100);
+} kern;

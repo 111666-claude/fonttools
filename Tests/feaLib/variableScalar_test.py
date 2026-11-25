@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from fontTools.designspaceLib import DesignSpaceDocument, AxisDescriptor
-from fontTools.feaLib.variableScalar import VariableScalar, VariableScalarBuilder
+from fontTools.feaLib.variableScalar import (
+    AxisValue,
+    VariableScalar,
+    VariableScalarBuilder,
+)
 from fontTools.fontBuilder import addFvar
 from fontTools.ttLib import newTable
 from fontTools.ttLib.ttFont import TTFont
@@ -20,6 +24,119 @@ def test_variable_scalar_repr():
     scalar.add_value({"wght": 700}, 10)
 
     assert str(scalar) == "(20 wght=400:1 wght=500.5:4 wght=700:10)"
+
+
+def _builder_with_avar():
+    return VariableScalarBuilder(
+        axis_triples={"wght": (200, 400, 800)},
+        axis_mappings={"wght": {-1.0: -1.0, -0.5: -0.2, 0.0: 0.0, 1.0: 1.0}},
+        model_cache={},
+    )
+
+
+def test_resolve_user_units():
+    builder = _builder_with_avar()
+    scalar = VariableScalar()
+    scalar.add_raw_value(None, 20)
+    scalar.add_raw_value((("wght", AxisValue(800.0, unit="u")),), 80)
+    builder.resolve(scalar)
+    assert scalar.values[(("wght", 800.0),)] == 80
+    # The default location is fully specified.
+    assert scalar.values[(("wght", 400),)] == 20
+
+
+def test_resolve_normalized_units():
+    builder = _builder_with_avar()
+    scalar = VariableScalar()
+    scalar.add_raw_value((("wght", AxisValue(1.0, unit="n")),), 80)
+    builder.resolve(scalar)
+    # 1n denormalizes to the axis maximum.
+    assert (("wght", 800.0),) in scalar.values
+
+    min_scalar = VariableScalar()
+    min_scalar.add_raw_value((("wght", AxisValue(-1.0, unit="n")),), 10)
+    builder.resolve(min_scalar)
+    assert (("wght", 200.0),) in min_scalar.values
+
+
+def test_resolve_adjacent_normalized_step():
+    builder = _builder_with_avar()
+    scalar = VariableScalar()
+    scalar.add_raw_value((("wght", AxisValue(0.0, unit="n", adjacent=1)),), 1)
+    builder.resolve(scalar)
+    ((loc, value),) = scalar.values.items()
+    # One F2dot14 step above the normalized default, denormalized along the
+    # positive half of the axis (400 -> 800).
+    assert loc == (("wght", 400 + (1 / 16384) * 400),)
+    assert value == 1
+
+
+def test_resolve_designer_units_without_mapping_equals_user():
+    # A TTF-derived builder has no design triples: d and u must coincide and
+    # avar is still applied at normalization time.
+    builder = _builder_with_avar()
+    d_scalar = VariableScalar()
+    d_scalar.add_raw_value((("wght", AxisValue(300.0, unit="d")),), 25)
+    builder.resolve(d_scalar)
+    u_scalar = VariableScalar()
+    u_scalar.add_raw_value((("wght", AxisValue(300.0, unit="u")),), 25)
+    builder.resolve(u_scalar)
+    assert d_scalar.values == u_scalar.values
+    loc = (("wght", 300.0),)
+    assert builder._normalize_location(loc) == {"wght": -0.2}
+
+
+def test_resolve_designer_units_with_designspace_mapping():
+    # With a real designspace mapping, designer values go through the
+    # inverse avar mapping before denormalization.
+    doc = DesignSpaceDocument()
+    doc.addAxis(
+        AxisDescriptor(
+            tag="wght",
+            minimum=200,
+            default=400,
+            maximum=800,
+            map=[(200, 50), (400, 100), (800, 150)],
+        )
+    )
+    builder = VariableScalarBuilder.from_designspace(doc)
+
+    scalar = VariableScalar()
+    # Designer 50 is the mapped minimum -> user minimum 200.
+    scalar.add_raw_value((("wght", AxisValue(50.0, unit="d")),), 10)
+    builder.resolve(scalar)
+    assert (("wght", 200.0),) in scalar.values
+
+    max_scalar = VariableScalar()
+    max_scalar.add_raw_value((("wght", AxisValue(150.0, unit="d")),), 80)
+    builder.resolve(max_scalar)
+    assert (("wght", 800.0),) in max_scalar.values
+
+
+def test_resolve_unknown_axis_raises_featureliberror():
+    from fontTools.feaLib.error import FeatureLibError
+
+    builder = _builder_with_avar()
+    scalar = VariableScalar()
+    scalar.add_raw_value((("slnt", AxisValue(0.0, unit="u")),), 1)
+    with pytest.raises(FeatureLibError, match="Unknown axis slnt"):
+        builder.resolve(scalar)
+
+
+def test_resolve_duplicate_location_raises():
+    builder = _builder_with_avar()
+    scalar = VariableScalar()
+    scalar.add_raw_value((("wght", AxisValue(200.0, unit="u")),), 10)
+    scalar.add_raw_value((("wght", AxisValue(200.0, unit="u")),), 20)
+    with pytest.raises(ValueError, match="Duplicate value for location"):
+        builder.resolve(scalar)
+
+
+def test_axis_value_asfea():
+    assert AxisValue(600.0, unit="d").asFea() == "600d"
+    assert AxisValue(0.0, unit="n", adjacent=1).asFea() == "0n+"
+    assert AxisValue(1.0, unit="n", adjacent=-1).asFea() == "1n-"
+    assert AxisValue(200.0, unit="u", explicit_unit=False).asFea() == "200"
 
 
 @pytest.mark.parametrize(

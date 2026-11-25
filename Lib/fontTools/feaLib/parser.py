@@ -1,6 +1,6 @@
 from fontTools.feaLib.error import FeatureLibError
 from fontTools.feaLib.lexer import Lexer, IncludingLexer, NonIncludingLexer
-from fontTools.feaLib.variableScalar import VariableScalar
+from fontTools.feaLib.variableScalar import AXIS_UNITS, AxisValue, VariableScalar
 from fontTools.misc.encodingTools import getEncoding
 from fontTools.misc.textTools import tobytes, tostr
 import fontTools.feaLib.ast as ast
@@ -65,7 +65,12 @@ class Parser(object):
         self.glyphclasses_ = SymbolTable()
         self.lookups_ = SymbolTable()
         self.valuerecords_ = SymbolTable()
-        self.symbol_tables_ = {self.anchors_, self.valuerecords_}
+        self.locations_ = SymbolTable()
+        self.symbol_tables_ = {
+            self.anchors_,
+            self.valuerecords_,
+            self.locations_,
+        }
         self.next_token_type_, self.next_token_ = (None, None)
         self.cur_comments_ = []
         self.next_token_location_ = None
@@ -93,6 +98,8 @@ class Parser(object):
                 statements.append(self.parse_anonymous_())
             elif self.is_cur_keyword_("anchorDef"):
                 statements.append(self.parse_anchordef_())
+            elif self.is_cur_keyword_("locationDef"):
+                statements.append(self.parse_locationdef_())
             elif self.is_cur_keyword_("languagesystem"):
                 statements.append(self.parse_languagesystem_())
             elif self.is_cur_keyword_("lookup"):
@@ -578,6 +585,7 @@ class Parser(object):
     _statement_keywords = frozenset(
         {
             "anchorDef",
+            "locationDef",
             "cvParameters",
             "enum",
             "enumerate",
@@ -2097,6 +2105,8 @@ class Parser(object):
                 statements.append(self.parse_glyphclass_definition_())
             elif self.is_cur_keyword_("anchorDef"):
                 statements.append(self.parse_anchordef_())
+            elif self.is_cur_keyword_("locationDef"):
+                statements.append(self.parse_locationdef_())
             elif self.is_cur_keyword_({"enum", "enumerate"}):
                 statements.append(self.parse_enumerate_(vertical=vertical))
             elif self.is_cur_keyword_("feature"):
@@ -2286,39 +2296,155 @@ class Parser(object):
                         self.cur_token_location_,
                     )
                 default_seen = True
-                location, value = {}, self.cur_token_
+                value = self.cur_token_
                 self.advance_lexer_()
+                scalar.add_raw_value(None, value)
             else:
                 location, value = self.expect_master_()
-            scalar.add_value(location, value)
+                scalar.add_raw_value(location, value)
         return scalar
 
     def expect_master_(self):
-        location = {}
+        location = self.expect_location_specifier_()
+        # The value follows a colon. The lexer treats ':' as a name character,
+        # so a directly adjacent value arrives glued to the unit or the colon.
+        if self.cur_token_type_ is Lexer.SYMBOL and self.cur_token_ == ":":
+            self.advance_lexer_()
+            if self.cur_token_type_ not in Lexer.NUMBERS:
+                raise FeatureLibError("Expected a number", self.cur_token_location_)
+            value = int(self.cur_token_)
+            self.advance_lexer_()
+            return location, value
+        if self.cur_token_type_ is Lexer.NAME and ":" in self.cur_token_:
+            text = self.cur_token_
+            number = text[text.rindex(":") + 1 :]
+            if not number:
+                self.advance_lexer_()
+                if self.cur_token_type_ not in Lexer.NUMBERS:
+                    raise FeatureLibError("Expected a number", self.cur_token_location_)
+                value = int(self.cur_token_)
+            else:
+                value = int(number)
+            self.advance_lexer_()
+            return location, value
+        raise FeatureLibError(
+            "Expected a colon before the location value", self.cur_token_location_
+        )
+
+    def parse_locationdef_(self):
+        # Parses a named location definition:
+        #   locationDef wght=1000d, opsz=60d @DisplayBlack;
+        assert self.is_cur_keyword_("locationDef")
+        location = self.cur_token_location_
+        self.advance_lexer_()
+        axis_values = self.expect_location_literal_()
+        if self.cur_token_type_ is not Lexer.GLYPHCLASS:
+            raise FeatureLibError(
+                "Expected a location name starting with '@'",
+                self.cur_token_location_,
+            )
+        name = self.cur_token_
+        self.expect_symbol_(";")
+        if self.locations_.resolve(name) is not None:
+            raise FeatureLibError(
+                'Location "@%s" has the same name as a previous location '
+                "definition" % name,
+                location,
+            )
+        locationdef = self.ast.LocationDefinition(name, axis_values, location=location)
+        self.locations_.define(name, locationdef)
+        return locationdef
+
+    def expect_location_specifier_(self):
+        """Parse either a named location (``@Name``) or an inline location
+        literal (``wght=1000d, opsz=60d``), returning a raw location tuple of
+        ``(axis tag, AxisValue)`` pairs."""
+        if self.cur_token_type_ is Lexer.GLYPHCLASS:
+            name = self.cur_token_
+            locationdef = self.locations_.resolve(name)
+            if locationdef is None:
+                raise FeatureLibError(
+                    'Unknown location "@%s"' % name, self.cur_token_location_
+                )
+            self.advance_lexer_()
+            return locationdef.axis_values
+        return self.expect_location_literal_()
+
+    def expect_location_literal_(self):
+        """Parse one or more comma-separated ``tag=value[u/d/n][+/-]`` axis
+        assignments."""
+        axis_values = []
+        seen_axes = set()
         while True:
             if self.cur_token_type_ is not Lexer.NAME:
                 raise FeatureLibError("Expected an axis name", self.cur_token_location_)
             axis = self.cur_token_
+            if axis in seen_axes:
+                raise FeatureLibError(
+                    'Axis "%s" is assigned more than once in location' % axis,
+                    self.cur_token_location_,
+                )
+            seen_axes.add(axis)
             self.advance_lexer_()
             if not (self.cur_token_type_ is Lexer.SYMBOL and self.cur_token_ == "="):
                 raise FeatureLibError(
                     "Expected an equals sign", self.cur_token_location_
                 )
-            value = self.expect_integer_or_float_()
-            location[axis] = value
-            if self.next_token_type_ is Lexer.NAME and self.next_token_[0] == ":":
-                # Lexer has just read the value as a glyph name. We'll correct it later
+            axis_value = self.expect_axis_value_()
+            axis_values.append((axis, axis_value))
+            if not (self.cur_token_type_ is Lexer.SYMBOL and self.cur_token_ == ","):
                 break
             self.advance_lexer_()
-            if not (self.cur_token_type_ is Lexer.SYMBOL and self.cur_token_ == ","):
-                raise FeatureLibError(
-                    "Expected an comma or an equals sign", self.cur_token_location_
-                )
+        return tuple(axis_values)
+
+    def expect_axis_value_(self):
+        """Parse a number with a required unit letter (u/d/n) and optional
+        adjacent position suffix (+/-), or a legacy unitless number.
+
+        On entry, the current token is the '='; on exit the current token is
+        the comma separating assignments, or the colon introducing the value."""
+        self.advance_lexer_()  # consume '='
+        number_location = self.cur_token_location_
+        if self.cur_token_type_ is Lexer.FLOAT:
+            value = self.cur_token_
+        elif self.cur_token_type_ is Lexer.NUMBER:
+            value = self.cur_token_
+        else:
+            raise FeatureLibError(
+                "Expected an integer or floating-point number",
+                self.cur_token_location_,
+            )
+        self.advance_lexer_()
+
+        # Legacy unitless syntax (e.g. wght=200, wght=200:-100) means user
+        # units. With no whitespace before the colon the value arrives glued
+        # to the number as a ":..." NAME token.
+        if self.cur_token_type_ is not Lexer.NAME or self.cur_token_.startswith(":"):
+            return AxisValue(float(value), unit="u", explicit_unit=False)
+
+        token = self.cur_token_
+        # With no whitespace before the colon, it arrives glued to the unit
+        # (e.g. "u:47" or "u:"). Split it off for expect_master_ to consume.
+        glued_value = None
+        had_colon = ":" in token
+        if had_colon:
+            token, glued_value = token.split(":", 1)
+        unit = token[0] if token else ""
+        if unit not in AXIS_UNITS or (len(token) > 1 and token[1] not in "+-"):
+            raise FeatureLibError(
+                "Expected an axis unit (u, d or n) after %s" % value,
+                number_location,
+            )
+        adjacent = 0
+        if len(token) > 1:
+            adjacent = 1 if token[1] == "+" else -1
+        if had_colon:
+            # Keep the colon (and any glued value) as the current token;
+            # expect_master_ knows how to split off the value.
+            self.cur_token_ = ":" + glued_value
+        else:
             self.advance_lexer_()
-        self.advance_lexer_()
-        value = int(self.cur_token_[1:])
-        self.advance_lexer_()
-        return location, value
+        return AxisValue(float(value), unit=unit, adjacent=adjacent)
 
     def expect_any_number_(self):
         self.advance_lexer_()

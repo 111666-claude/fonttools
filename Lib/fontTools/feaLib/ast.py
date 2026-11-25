@@ -29,6 +29,7 @@ __all__ = [
     "AlternateSubstStatement",
     "Anchor",
     "AnchorDefinition",
+    "LocationDefinition",
     "AttachStatement",
     "AxisValueLocationStatement",
     "BaseAxis",
@@ -679,6 +680,26 @@ class AnchorDefinition(Statement):
             res += " contourpoint {}".format(self.contourpoint)
         res += " {};".format(self.name)
         return res
+
+
+class LocationDefinition(Statement):
+    """A named designspace location definition (``locationDef``).
+
+    ``name`` is the location name without the leading ``@`` and
+    ``axis_values`` is a tuple of ``(axis tag, AxisValue)`` pairs as written
+    in the feature file, including their u/d/n units."""
+
+    def __init__(self, name, axis_values, location=None):
+        Statement.__init__(self, location)
+        self.name = name
+        self.axis_values = axis_values
+
+    def asFea(self, indent=""):
+        literal = ", ".join(
+            "{}={}".format(axis, axis_value.asFea())
+            for axis, axis_value in self.axis_values
+        )
+        return "locationDef {} @{};".format(literal, self.name)
 
 
 class AttachStatement(Statement):

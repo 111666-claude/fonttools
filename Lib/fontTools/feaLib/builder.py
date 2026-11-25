@@ -1799,14 +1799,21 @@ class Builder(object):
                 "Can't define a variable scalar in a non-variable font", location
             )
 
-        if not varscalar.does_vary:
-            return self.scalar_builder.default_value(varscalar), None
-
         try:
+            if not varscalar.values:
+                # Raw locations carry u/d/n units and are only resolved now
+                # that the font's axes are known.
+                self.scalar_builder.resolve(varscalar, fea_location=location)
+
+            if not varscalar.does_vary:
+                return self.scalar_builder.default_value(varscalar), None
+
             default, index = self.scalar_builder.add_to_variation_store(
                 varscalar, self.varstorebuilder
             )
-        except VarLibError as e:
+        except FeatureLibError:
+            raise
+        except (VarLibError, ValueError) as e:
             raise FeatureLibError(
                 "Failed to compute deltas for variable scalar", location
             ) from e

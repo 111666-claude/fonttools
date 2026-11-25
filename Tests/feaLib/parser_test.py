@@ -2,6 +2,7 @@
 from fontTools.misc.loggingTools import CapturingLogHandler
 from fontTools.feaLib.error import FeatureLibError
 from fontTools.feaLib.parser import Parser, SymbolTable
+from fontTools.feaLib.variableScalar import AxisValue
 from io import StringIO
 import warnings
 import fontTools.feaLib.ast as ast
@@ -2345,6 +2346,148 @@ class ParserTest(unittest.TestCase):
             self.parse,
             "feature test {pos a (10 20 wght=900:30);} test",
         )
+
+    def test_locationdef_top_level(self):
+        doc = self.parse("locationDef wght=1000d, opsz=60d @DisplayBlack;")
+        [locationdef] = doc.statements
+        self.assertEqual(type(locationdef), ast.LocationDefinition)
+        self.assertEqual(locationdef.name, "DisplayBlack")
+        self.assertEqual(
+            locationdef.asFea(), "locationDef wght=1000d, opsz=60d @DisplayBlack;"
+        )
+
+    def test_locationdef_all_units(self):
+        doc = self.parse(
+            "locationDef wght=200u @U; "
+            "locationDef wght=1000d @D; "
+            "locationDef wght=-1n @N; "
+            "locationDef wght=0n+, wdth=1n- @Adjacent;"
+        )
+        self.assertEqual(len(doc.statements), 4)
+        self.assertEqual(
+            doc.statements[3].asFea(),
+            "locationDef wght=0n+, wdth=1n- @Adjacent;",
+        )
+
+    def test_locationdef_named_reference_equals_inline(self):
+        named = self.parse(
+            "locationDef wght=1000d, opsz=60d @DisplayBlack;\n"
+            "feature kern { pos a (50 @DisplayBlack:51); } kern;"
+        )
+        inline = self.parse("feature kern { pos a (50 wght=1000d,opsz=60d:51); } kern;")
+        named_scalar = self._find_variable_scalar(named)
+        inline_scalar = self._find_variable_scalar(inline)
+        self.assertEqual(named_scalar.raw_values, inline_scalar.raw_values)
+
+    def test_locationdef_named_reference_with_spaces(self):
+        # Whitespace before the colon must not break the named reference.
+        doc = self.parse(
+            "locationDef wght=900u @Heavy;\n"
+            "feature kern { pos a (0 @Heavy :100); } kern;"
+        )
+        scalar = self._find_variable_scalar(doc)
+        self.assertEqual(
+            scalar.raw_values,
+            [
+                (None, 0),
+                (
+                    (("wght", AxisValue(900.0, unit="u", explicit_unit=True)),),
+                    100,
+                ),
+            ],
+        )
+
+    def test_locationdef_value_record_and_anchor(self):
+        doc = self.parse(
+            "locationDef wght=900u @Heavy;\n"
+            "valueRecordDef (0 @Heavy:100) KERNA;\n"
+            "feature kern { pos cursive A "
+            "<anchor (0 @Heavy:12) 0> <anchor NULL>; } kern;"
+        )
+        scalars = self._find_variable_scalars(doc)
+        self.assertEqual(len(scalars), 2)
+
+    def test_locationdef_duplicate(self):
+        self.assertRaisesRegex(
+            FeatureLibError,
+            'Location "@A" has the same name as a previous location definition',
+            self.parse,
+            "locationDef wght=100d @A; locationDef wght=200d @A;",
+        )
+
+    def test_locationdef_unknown_reference(self):
+        self.assertRaisesRegex(
+            FeatureLibError,
+            'Unknown location "@Nope"',
+            self.parse,
+            "feature kern { pos a (0 @Nope:10); } kern;",
+        )
+
+    def test_locationdef_unknown_unit(self):
+        self.assertRaisesRegex(
+            FeatureLibError,
+            "Expected an axis unit \\(u, d or n\\)",
+            self.parse,
+            "locationDef wght=100x @A;",
+        )
+
+    def test_locationdef_repeated_axis(self):
+        self.assertRaisesRegex(
+            FeatureLibError,
+            'Axis "wght" is assigned more than once in location',
+            self.parse,
+            "locationDef wght=100d, wght=200d @A;",
+        )
+
+    def test_locationdef_include_scope(self):
+        # A location defined in an included file is visible afterwards, since
+        # includes share the top-level symbol scope.
+        fea_path = self.getpath("include/locationdef.fea")
+        doc = Parser(fea_path, GLYPHNAMES).parse()
+        scalar = self._find_variable_scalar(doc)
+        self.assertEqual(scalar.raw_values[1][0][0][0], "wght")
+        self.assertEqual(scalar.raw_values[1][0][0][1].value, 900.0)
+
+    def test_locationdef_fea_round_trip(self):
+        source = (
+            "locationDef wght=1000d, opsz=60d @DisplayBlack;\n"
+            "locationDef wght=0n+ @Light;\n"
+            "feature kern {\n"
+            "    pos a (50 @Light:47 @DisplayBlack:51);\n"
+            "} kern;"
+        )
+        doc = self.parse(source)
+        emitted = doc.asFea()
+        reparsed = self.parse(emitted)
+        self.assertEqual(
+            [s.raw_values for s in self._find_variable_scalars(doc)],
+            [s.raw_values for s in self._find_variable_scalars(reparsed)],
+        )
+        self.assertIn("locationDef wght=1000d, opsz=60d @DisplayBlack;", emitted)
+        self.assertIn("locationDef wght=0n+ @Light;", emitted)
+
+    @staticmethod
+    def _find_variable_scalars(node):
+        from fontTools.feaLib.variableScalar import VariableScalar
+
+        found = []
+
+        def walk(element):
+            if isinstance(element, VariableScalar):
+                found.append(element)
+            elif hasattr(element, "__dict__"):
+                for value in vars(element).values():
+                    walk(value)
+            elif isinstance(element, (list, tuple)):
+                for value in element:
+                    walk(value)
+
+        walk(node)
+        return found
+
+    def _find_variable_scalar(self, doc):
+        [scalar] = self._find_variable_scalars(doc)
+        return scalar
 
     def parse(self, text, glyphNames=GLYPHNAMES, followIncludes=True):
         featurefile = StringIO(text)

@@ -46,6 +46,31 @@ class LexerTest(unittest.TestCase):
             FeatureLibError, "Glyph class names must consist of", lex, "@Ab:c"
         )
 
+    def test_named_location_colon(self):
+        # A named location followed by a colon+value splits into a glyph class
+        # and a ":..." name token (the parser splits off the value itself);
+        # a colon without a value after it stays an illegal class name.
+        self.assertEqual(
+            lex("@mm:47"),
+            [(Lexer.GLYPHCLASS, "mm"), (Lexer.NAME, ":47")],
+        )
+        self.assertEqual(
+            lex("@Bold:<0 100 0 0>"),
+            [
+                (Lexer.GLYPHCLASS, "Bold"),
+                (Lexer.NAME, ":"),
+                (Lexer.SYMBOL, "<"),
+                (Lexer.NUMBER, 0),
+                (Lexer.NUMBER, 100),
+                (Lexer.NUMBER, 0),
+                (Lexer.NUMBER, 0),
+                (Lexer.SYMBOL, ">"),
+            ],
+        )
+        self.assertRaisesRegex(
+            FeatureLibError, "Glyph class names must consist of", lex, "@Ab:c"
+        )
+
     def test_include(self):
         self.assertEqual(
             lex("include (~/foo/bar baz.fea);"),

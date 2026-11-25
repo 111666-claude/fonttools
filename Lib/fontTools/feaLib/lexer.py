@@ -107,11 +107,34 @@ class Lexer(object):
             return (Lexer.CID, int(text[start + 1 : self.pos_], 10), location)
         if cur_char == "@":
             self.pos_ += 1
-            self.scan_over_(Lexer.CHAR_NAME_CONTINUATION_)
+            # A colon separates a named location from its value (e.g.
+            # ``@mm:47`` or ``@Bold:<0 100 0 0>``), so it is not part of the
+            # glyph class name even though CHAR_NAME_CONTINUATION_ contains it.
+            while (
+                self.pos_ < limit
+                and text[self.pos_] in Lexer.CHAR_NAME_CONTINUATION_
+                and text[self.pos_] != ":"
+            ):
+                self.pos_ += 1
             glyphclass = text[start + 1 : self.pos_]
             if len(glyphclass) < 1:
                 raise FeatureLibError("Expected glyph class name", location)
             if not Lexer.RE_GLYPHCLASS.match(glyphclass):
+                raise FeatureLibError(
+                    "Glyph class names must consist of letters, digits, "
+                    "underscore, period or hyphen",
+                    location,
+                )
+            if self.pos_ < limit and text[self.pos_] == ":":
+                # Only split when a value follows (a number or a value record,
+                # possibly after whitespace); otherwise the colon is still
+                # illegal in a glyph class name.
+                lookahead = self.pos_ + 1
+                while lookahead < limit and text[lookahead] in " \t\r\n":
+                    lookahead += 1
+                following = text[lookahead] if lookahead < limit else ""
+                if following.isdigit() or following in "<+-":
+                    return (Lexer.GLYPHCLASS, glyphclass, location)
                 raise FeatureLibError(
                     "Glyph class names must consist of letters, digits, "
                     "underscore, period or hyphen",
