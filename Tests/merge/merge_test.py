@@ -352,6 +352,279 @@ def _merge_and_recompile(fontfiles, options=None):
     return ttLib.TTFont(buf)
 
 
+def _make_tt_font(family, codepoints, *, widths=None):
+    glyphOrder = [".notdef"] + [chr(cp) for cp in codepoints]
+    cmap = {cp: chr(cp) for cp in codepoints}
+    glyphs = {gn: Glyph() for gn in glyphOrder}
+    widths = widths or {}
+    hmtx = {gn: (widths.get(gn, 500), 0) for gn in glyphOrder}
+
+    fb = FontBuilder(unitsPerEm=1000, isTTF=True)
+    fb.setupGlyphOrder(glyphOrder)
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(hmtx)
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": family, "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    return fb.font
+
+
+def _make_cff_font(family, codepoints):
+    from fontTools.fontBuilder import FontBuilder as FB
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+
+    glyphOrder = [".notdef"] + [chr(cp) for cp in codepoints]
+    cmap = {cp: chr(cp) for cp in codepoints}
+    fb = FB(unitsPerEm=1000, isTTF=False)
+    fb.setupGlyphOrder(glyphOrder)
+    fb.setupCharacterMap(cmap)
+
+    def empty_charstring(width=500):
+        pen = T2CharStringPen(width, None)
+        return pen.getCharString()
+
+    fb.setupCFF(
+        psName=family + "-Regular",
+        fontInfo={"FullName": family, "FamilyName": family, "Weight": "Regular"},
+        charStringsDict={gn: empty_charstring() for gn in glyphOrder},
+        privateDict={},
+    )
+    fb.setupHorizontalMetrics({gn: (500, 0) for gn in glyphOrder})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": family, "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    return fb.font
+
+
+def _font_signature(font):
+    """Serializable description used to compare two merged fonts."""
+    buf = _compile(font)
+    reopened = ttLib.TTFont(io.BytesIO(buf.getvalue()))
+    return {
+        "sfntVersion": reopened.sfntVersion,
+        "glyphOrder": tuple(reopened.getGlyphOrder()),
+        "cmap": tuple(sorted(reopened.getBestCmap().items())),
+        "name4": reopened["name"].getDebugName(4),
+        "tables": tuple(reopened.keys()),
+        "hmtx": tuple(sorted(reopened["hmtx"].metrics.items())),
+    }
+
+
+class MergeFontObjectsTest(unittest.TestCase):
+    """Merger.merge() must accept TTFont objects alongside paths/streams."""
+
+    def setUp(self):
+        self.fontA = _make_tt_font("FamA", [0x61, 0x62], widths={"a": 300})
+        self.fontB = _make_tt_font("FamB", [0x63, 0x64], widths={"c": 700})
+        self.fontCff = _make_cff_font("FamCff", [0x65])
+
+    def _path_pair(self):
+        # Write the in-memory fonts to disk without mutating the objects, then
+        # reopen fresh objects from those bytes for the path-based merge.
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dirpath)
+        paths = []
+        for font in (self.fontA, self.fontB):
+            path = os.path.join(dirpath, "font%d.ttf" % len(paths))
+            font.save(path)
+            paths.append(path)
+        return paths
+
+    def test_merge_ttfont_objects(self):
+        merged = Merger().merge([self.fontA, self.fontB])
+
+        self.assertEqual(
+            merged.getGlyphOrder(),
+            [".notdef", "a", "b", ".notdef.1", "c", "d"],
+        )
+        self.assertEqual(sorted(merged.getBestCmap().keys()), [0x61, 0x62, 0x63, 0x64])
+        # Metrics from both fonts are retained.
+        self.assertEqual(merged["hmtx"]["a"][0], 300)
+        self.assertEqual(merged["hmtx"]["c"][0], 700)
+
+    def test_path_and_object_merge_equivalent(self):
+        pathA, pathB = self._path_pair()
+
+        merged_from_paths = Merger().merge([pathA, pathB])
+        merged_from_objects = Merger().merge([self.fontA, self.fontB])
+        merged_mixed = Merger().merge([pathA, ttLib.TTFont(_compile(self.fontB))])
+
+        signature = _font_signature(merged_from_paths)
+        self.assertEqual(signature, _font_signature(merged_from_objects))
+        self.assertEqual(signature, _font_signature(merged_mixed))
+
+        # The merged fonts survive a binary round trip and reopen identically.
+        for merged in (merged_from_paths, merged_from_objects, merged_mixed):
+            buf = _compile(merged)
+            reopened = ttLib.TTFont(io.BytesIO(buf.getvalue()))
+            self.assertEqual(tuple(reopened.getGlyphOrder()), signature["glyphOrder"])
+            self.assertEqual(
+                tuple(sorted(reopened.getBestCmap().items())), signature["cmap"]
+            )
+
+    def test_unsaved_in_memory_changes_are_merged(self):
+        self.fontA["name"].setName("InMemoryFamily", 1, 3, 1, 0x409)
+        self.fontA["name"].setName("InMemoryFull", 4, 3, 1, 0x409)
+        snapshot = self.fontA["name"].getDebugName(4)
+
+        merged = Merger().merge([self.fontA, self.fontB])
+
+        self.assertEqual(merged["name"].getDebugName(1), "InMemoryFamily")
+        self.assertEqual(merged["name"].getDebugName(4), "InMemoryFull")
+        # The caller's object still holds its unsaved state, untouched.
+        self.assertEqual(self.fontA["name"].getDebugName(4), snapshot)
+
+    def test_caller_objects_are_not_modified(self):
+        orderA = list(self.fontA.getGlyphOrder())
+        orderB = list(self.fontB.getGlyphOrder())
+        tablesA = set(self.fontA.keys())
+        headModifiedA = self.fontA["head"].modified
+
+        Merger().merge([self.fontA, self.fontB])
+
+        self.assertEqual(list(self.fontA.getGlyphOrder()), orderA)
+        self.assertEqual(list(self.fontB.getGlyphOrder()), orderB)
+        self.assertEqual(set(self.fontA.keys()), tablesA)
+        # save() inside the merger must not recalc timestamps on the caller.
+        self.assertEqual(self.fontA["head"].modified, headModifiedA)
+        # The caller's font must remain fully usable and independently savable.
+        buf = _compile(self.fontA)
+        self.assertEqual(ttLib.TTFont(buf).getGlyphOrder(), orderA)
+
+    def test_lazy_objects_keep_lazy_reader_and_stream(self):
+        pathA, pathB = self._path_pair()
+        lazyA = ttLib.TTFont(pathA, lazy=True)
+        lazyB = ttLib.TTFont(pathB, lazy=True)
+        self.addCleanup(lazyA.close)
+        self.addCleanup(lazyB.close)
+
+        merged = Merger().merge([lazyA, lazyB])
+        _compile(merged)  # merged result is valid and saveable
+
+        self.assertTrue(lazyA.lazy)
+        self.assertIsNotNone(lazyA.reader)
+        self.assertTrue(lazyB.lazy)
+        self.assertIsNotNone(lazyB.reader)
+        # Original glyph orders were never renamed in place.
+        self.assertEqual(lazyA.getGlyphOrder(), [".notdef", "a", "b"])
+
+    def test_merged_result_survives_caller_stream_closing(self):
+        pathA, pathB = self._path_pair()
+        fontA = ttLib.TTFont(pathA, lazy=True)
+        fontB = ttLib.TTFont(pathB, lazy=True)
+
+        merged = Merger().merge([fontA, fontB])
+        fontA.close()
+        fontB.close()
+
+        # The merger holds no reference to the caller's input streams.
+        buf = _compile(merged)
+        reopened = ttLib.TTFont(io.BytesIO(buf.getvalue()))
+        self.assertEqual(
+            reopened.getGlyphOrder(),
+            [".notdef", "a", "b", ".notdef.1", "c", "d"],
+        )
+
+    def test_shared_table_cache(self):
+        pathA, pathB = self._path_pair()
+        tableCache = {}
+        fontA = ttLib.TTFont(pathA, lazy=True, _tableCache=tableCache)
+        fontB = ttLib.TTFont(pathB, lazy=True, _tableCache=tableCache)
+
+        merged = Merger().merge([fontA, fontB])
+        _compile(merged)
+
+        # The caller's shared cache is untouched.
+        self.assertIs(fontA._tableCache, tableCache)
+        self.assertIs(fontB._tableCache, tableCache)
+
+    def test_same_object_passed_more_than_once(self):
+        merged = Merger().merge([self.fontA, self.fontA])
+
+        order = merged.getGlyphOrder()
+        self.assertEqual(order, [".notdef", "a", "b", ".notdef.1", "a.1", "b.1"])
+        # The binary output must contain every renamed glyph.
+        buf = _compile(merged)
+        reopened = ttLib.TTFont(io.BytesIO(buf.getvalue()))
+        self.assertEqual(tuple(reopened.getGlyphOrder()), tuple(order))
+        # Caller untouched.
+        self.assertEqual(self.fontA.getGlyphOrder(), [".notdef", "a", "b"])
+
+    def test_cff_objects(self):
+        cff = self.fontCff
+        order_before = cff.getGlyphOrder()
+
+        merged = Merger().merge([cff, cff])
+
+        self.assertEqual(merged.sfntVersion, "OTTO")
+        self.assertIn("CFF ", merged)
+        self.assertEqual(merged.getGlyphOrder(), [".notdef", "e", ".notdef.1", "e.1"])
+        buf = _compile(merged)
+        reopened = ttLib.TTFont(io.BytesIO(buf.getvalue()))
+        self.assertEqual(reopened.sfntVersion, "OTTO")
+        self.assertEqual(reopened.getGlyphOrder(), merged.getGlyphOrder())
+        self.assertEqual(cff.getGlyphOrder(), order_before)
+
+    def test_invalid_argument_is_locatable(self):
+        with self.assertRaises(TypeError) as cm:
+            Merger().merge([self.fontA, 12345])
+        message = str(cm.exception)
+        self.assertIn("fontfiles[1]", message)
+        self.assertIn("int", message)
+
+    def test_invalid_first_argument_is_locatable(self):
+        with self.assertRaises(TypeError) as cm:
+            Merger().merge([object()])
+        self.assertIn("fontfiles[0]", str(cm.exception))
+
+    def test_no_temporary_font_files(self):
+        import builtins
+
+        real_open = builtins.open
+        real_mkstemp = tempfile.mkstemp
+        real_mkdtemp = tempfile.mkdtemp
+
+        def fail_open(file, mode="r", *args, **kwargs):
+            if any(flag in mode for flag in ("w", "a", "x", "+")):
+                raise AssertionError(
+                    "merge() of TTFont objects must not write to the file system: %r"
+                    % file
+                )
+            return real_open(file, mode, *args, **kwargs)
+
+        def fail_mkstemp(*args, **kwargs):
+            raise AssertionError("merge() must not create temporary files")
+
+        def fail_mkdtemp(*args, **kwargs):
+            raise AssertionError("merge() must not create temporary directories")
+
+        builtins.open = fail_open
+        tempfile.mkstemp = fail_mkstemp
+        tempfile.mkdtemp = fail_mkdtemp
+        try:
+            merged = Merger().merge([self.fontA, self.fontB])
+        finally:
+            builtins.open = real_open
+            tempfile.mkstemp = real_mkstemp
+            tempfile.mkdtemp = real_mkdtemp
+
+        self.assertEqual(
+            merged.getGlyphOrder(),
+            [".notdef", "a", "b", ".notdef.1", "c", "d"],
+        )
+
+    def test_pathlike_inputs_still_work(self):
+        pathA, pathB = self._path_pair()
+        merged = Merger().merge([pathlib.Path(pathA), pathlib.Path(pathB)])
+        self.assertEqual(
+            merged.getGlyphOrder(),
+            [".notdef", "a", "b", ".notdef.1", "c", "d"],
+        )
+
+
 def test_merge_head_different_units_per_em():
     heads = []
     for units_per_em in (1000, 2048):

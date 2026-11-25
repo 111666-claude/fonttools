@@ -2,6 +2,10 @@
 #
 # Google Author(s): Behdad Esfahbod, Roozbeh Pournader
 
+import copy
+import os
+from io import BytesIO
+
 from fontTools import ttLib
 import fontTools.merge.base
 from fontTools.merge.cmap import (
@@ -54,24 +58,87 @@ class Merger(object):
             options = Options()
 
         self.options = options
+        # Cache of serialized font data captured from TTFont inputs, keyed by
+        # object identity. It lets the two merge passes reopen the same private
+        # snapshot without ever saving a temporary file or touching the caller's
+        # object more than once.
+        self._fontObjectData = {}
+
+    @staticmethod
+    def _readFontObject(font):
+        # Serialize an independent deep copy, never the caller's object:
+        # compiling can have side effects on in-memory tables (for example
+        # recalculating timestamps or glyph bounding boxes). The resulting bytes
+        # capture all unsaved in-memory table changes.
+        data = BytesIO()
+        copy.deepcopy(font).save(data)
+        return data.getvalue()
+
+    def _openFont(self, fontfile, index):
+        if isinstance(fontfile, ttLib.TTFont):
+            # Reopen a private in-memory snapshot so the caller's font object,
+            # including any unsaved table changes, is never closed, rewritten
+            # or mutated. Reopening from bytes mirrors what happens with path
+            # inputs, including lazy table loading. The same object listed more
+            # than once maps to the same snapshot but yields independent fonts.
+            key = id(fontfile)
+            data = self._fontObjectData.get(key)
+            if data is None:
+                data = self._readFontObject(fontfile)
+                self._fontObjectData[key] = data
+            font = ttLib.TTFont(BytesIO(data))
+            label = fontfile
+        elif isinstance(fontfile, (str, os.PathLike)):
+            font = ttLib.TTFont(fontfile)
+            label = os.fspath(fontfile)
+        elif hasattr(fontfile, "read"):
+            # A binary stream containing a compiled sfnt font; let TTFont own
+            # the reading. The stream is not closed by the merger.
+            font = ttLib.TTFont(fontfile)
+            label = getattr(fontfile, "name", repr(fontfile))
+        else:
+            raise TypeError(
+                "fontfiles[%d]: expected a fontTools.ttLib.TTFont object, a "
+                "font file path (str or os.PathLike) or a binary file object, "
+                "but got %s: %r" % (index, type(fontfile).__name__, fontfile)
+            )
+        font._merger__fontfile = label
+        font._merger__name = font["name"].getDebugName(4) if "name" in font else None
+        return font
 
     def _openFonts(self, fontfiles):
-        fonts = [ttLib.TTFont(fontfile) for fontfile in fontfiles]
-        for font, fontfile in zip(fonts, fontfiles):
-            font._merger__fontfile = fontfile
-            font._merger__name = font["name"].getDebugName(4)
-        return fonts
+        return [
+            self._openFont(fontfile, index) for index, fontfile in enumerate(fontfiles)
+        ]
 
     def merge(self, fontfiles):
         """Merges fonts together.
 
         Args:
-                fontfiles: A list of file names to be merged
+                fontfiles: A list of fonts to be merged. Each item can be a file
+                        name (``str`` or :class:`os.PathLike`), a binary file
+                        object holding a compiled font, or an in-memory
+                        :class:`fontTools.ttLib.TTFont` object; the three kinds
+                        can be freely mixed. Fonts given as objects are merged
+                        from their current in-memory state, including unsaved
+                        table changes. The passed-in objects are never modified,
+                        closed or saved, and the same object may be listed more
+                        than once.
 
         Returns:
                 A :class:`fontTools.ttLib.TTFont` object. Call the ``save`` method on
                 this to write it out to an OTF file.
         """
+        # Each TTFont input is serialized into a private in-memory snapshot once;
+        # both passes below reopen that snapshot. Drop any snapshots left over
+        # from a previous merge() call on this Merger instance.
+        self._fontObjectData = {}
+        try:
+            return self._merge(fontfiles)
+        finally:
+            self._fontObjectData = {}
+
+    def _merge(self, fontfiles):
         #
         # Settle on a mega glyph order.
         #
