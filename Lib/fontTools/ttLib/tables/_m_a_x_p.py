@@ -71,9 +71,14 @@ class table__m_a_x_p(DefaultTable.DefaultTable):
         of the flags field and the font bounding box of the 'head' table.
         """
         glyfTable = ttFont[self.glyphTableTag]
-        hmtxTable = ttFont[self.metricsTableTag]
-        headTable = ttFont["head"]
-        self.numGlyphs = len(glyfTable)
+        # 'head' is required for a valid sfnt but a minimal/partial font may
+        # omit it; the empty bitmap-only shell in particular has no bounds to
+        # write back, so tolerate its absence rather than raising KeyError.
+        headTable = ttFont["head"] if "head" in ttFont else None
+        # numGlyphs is a font-wide count from the global glyph order. In a
+        # bitmap-only OTB shell glyf.glyphs is intentionally empty even though
+        # the order (and maxp.numGlyphs) still lists all bitmap glyphs.
+        self.numGlyphs = len(ttFont.getGlyphOrder())
         INFINITY = 100000
         xMin = +INFINITY
         yMin = +INFINITY
@@ -87,47 +92,58 @@ class table__m_a_x_p(DefaultTable.DefaultTable):
         maxComponentDepth = 0
         allXMinIsLsb = 1
         maxpValuesCache = {}
-        for glyphName in ttFont.getGlyphOrder():
-            g = glyfTable[glyphName]
-            if g.numberOfContours:
-                if hmtxTable[glyphName][1] != g.xMin:
-                    allXMinIsLsb = 0
-                xMin = min(xMin, g.xMin)
-                yMin = min(yMin, g.yMin)
-                xMax = max(xMax, g.xMax)
-                yMax = max(yMax, g.yMax)
-                if g.numberOfContours > 0:
-                    nPoints, nContours = g.getMaxpValues()
-                    maxPoints = max(maxPoints, nPoints)
-                    maxContours = max(maxContours, nContours)
-                elif g.isComposite():
-                    nPoints, nContours, componentDepth = g.getCompositeMaxpValues(
-                        glyfTable, maxpValuesCache=maxpValuesCache
-                    )
-                    maxCompositePoints = max(maxCompositePoints, nPoints)
-                    maxCompositeContours = max(maxCompositeContours, nContours)
-                    maxComponentElements = max(maxComponentElements, len(g.components))
-                    maxComponentDepth = max(maxComponentDepth, componentDepth)
-        if xMin == +INFINITY:
-            headTable.xMin = 0
-            headTable.yMin = 0
-            headTable.xMax = 0
-            headTable.yMax = 0
-        else:
-            headTable.xMin = xMin
-            headTable.yMin = yMin
-            headTable.xMax = xMax
-            headTable.yMax = yMax
+        # An empty glyf shell has no outline records to recalculate from;
+        # leave the extents at their zero defaults below instead of indexing
+        # the (empty) glyph mapping for every name in the global order.
+        if getattr(glyfTable, "glyphs", None):
+            # hmtx is only needed to compare side bearings while walking
+            # actual outline glyphs; a shell need not contain it.
+            hmtxTable = ttFont[self.metricsTableTag]
+            for glyphName in ttFont.getGlyphOrder():
+                g = glyfTable[glyphName]
+                if g.numberOfContours:
+                    if hmtxTable[glyphName][1] != g.xMin:
+                        allXMinIsLsb = 0
+                    xMin = min(xMin, g.xMin)
+                    yMin = min(yMin, g.yMin)
+                    xMax = max(xMax, g.xMax)
+                    yMax = max(yMax, g.yMax)
+                    if g.numberOfContours > 0:
+                        nPoints, nContours = g.getMaxpValues()
+                        maxPoints = max(maxPoints, nPoints)
+                        maxContours = max(maxContours, nContours)
+                    elif g.isComposite():
+                        nPoints, nContours, componentDepth = g.getCompositeMaxpValues(
+                            glyfTable, maxpValuesCache=maxpValuesCache
+                        )
+                        maxCompositePoints = max(maxCompositePoints, nPoints)
+                        maxCompositeContours = max(maxCompositeContours, nContours)
+                        maxComponentElements = max(
+                            maxComponentElements, len(g.components)
+                        )
+                        maxComponentDepth = max(maxComponentDepth, componentDepth)
+        if headTable is not None:
+            if xMin == +INFINITY:
+                headTable.xMin = 0
+                headTable.yMin = 0
+                headTable.xMax = 0
+                headTable.yMax = 0
+            else:
+                headTable.xMin = xMin
+                headTable.yMin = yMin
+                headTable.xMax = xMax
+                headTable.yMax = yMax
         self.maxPoints = maxPoints
         self.maxContours = maxContours
         self.maxCompositePoints = maxCompositePoints
         self.maxCompositeContours = maxCompositeContours
         self.maxComponentElements = maxComponentElements
         self.maxComponentDepth = maxComponentDepth
-        if allXMinIsLsb:
-            headTable.flags = headTable.flags | 0x2
-        else:
-            headTable.flags = headTable.flags & ~0x2
+        if headTable is not None:
+            if allXMinIsLsb:
+                headTable.flags = headTable.flags | 0x2
+            else:
+                headTable.flags = headTable.flags & ~0x2
 
     def testrepr(self):
         items = sorted(self.__dict__.items())

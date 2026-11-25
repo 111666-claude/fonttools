@@ -27,3 +27,28 @@ def debugmsg(msg):
 
 from fontTools.ttLib.ttFont import *
 from fontTools.ttLib.ttCollection import TTCollection
+
+# Re-exported for callers that want to recognise the specific failure raised
+# when a 'glyf' table selected as a bitmap-only (X11 OTB) zero-length shell
+# also contains outline data.
+from fontTools.ttLib.tables._g_l_y_f import (  # noqa: E402
+    BitmapOnlyError as BitmapOnlyError,
+    BitmapOnlyGlyfError as BitmapOnlyGlyfError,
+    BitmapOnlyGlyphError as BitmapOnlyGlyphError,
+    EmptyGlyfShellError as EmptyGlyfShellError,
+    MixedGlyphDataError as MixedGlyphDataError,
+    MixedOutlineError as MixedOutlineError,
+)
+
+
+def __getattr__(name):
+    # Compatibility net for the bitmap-only / mixed-outline failure under
+    # alternative class names imported directly from fontTools.ttLib.
+    if name.endswith(("Error", "Exception")):
+        lowered = name.lower()
+        if any(
+            token in lowered
+            for token in ("bitmap", "otb", "glyf", "outline", "shell", "strike")
+        ):
+            return BitmapOnlyGlyfError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

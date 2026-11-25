@@ -227,6 +227,9 @@ ttLib.getTableClass("glyf").mergeMap = {
     "glyphOrder": sumLists,
     "_reverseGlyphOrder": recalculate,
     "axisTags": equal,
+    # All merged fonts must agree on whether glyf is a zero-length
+    # bitmap-only OTB shell; mixing the two models is not mergeable.
+    "bitmapOnly": equal,
 }
 ttLib.getTableClass("GLYF").mergeMap = ttLib.getTableClass("glyf").mergeMap
 

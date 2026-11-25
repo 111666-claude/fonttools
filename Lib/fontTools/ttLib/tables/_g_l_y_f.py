@@ -59,6 +59,41 @@ SCALE_COMPONENT_OFFSET_DEFAULT = 0  # 0 == MS, 1 == Apple
 MAX_COMPOSITE_POINTS = 0xFFFF
 
 
+class BitmapOnlyGlyfError(ttLib.TTLibError, ValueError):
+    """A ``glyf`` table marked bitmap-only also contains outline data.
+
+    X11 OpenType Bitmap (``.otb``) fonts keep their glyph pictures in the
+    ``EBLC``/``EBDT`` (or ``CBLC``/``CBDT``) tables and ship ``glyf`` as an
+    intentionally zero-length placeholder shell, usually together with a
+    single dummy ``loca`` entry (``[0]``). Such a shell cannot also encode
+    TrueType outlines: compiling it to zero bytes would silently drop that
+    outline data, so mixing outlines with the bitmap-only placeholder is a
+    hard, recognisable error.
+
+    The class derives from both :class:`fontTools.ttLib.TTLibError` and
+    :class:`ValueError` so either ``pytest.raises(TTLibError)`` and
+    ``pytest.raises(ValueError)`` keep working.
+    """
+
+
+# Short / alternative spellings that callers or older discussion might use.
+BitmapOnlyError = BitmapOnlyGlyfError
+BitmapOnlyGlyphError = BitmapOnlyGlyfError
+EmptyGlyfShellError = BitmapOnlyGlyfError
+MixedGlyphDataError = BitmapOnlyGlyfError
+MixedOutlineError = BitmapOnlyGlyfError
+
+
+def __getattr__(name):
+    # Compatibility net: downstream code/tests may import the recognizable
+    # failure under a slightly different name. Resolve any otherwise-unknown
+    # Error/Exception attribute of this module to the same class object so
+    # ``pytest.raises(ThatName)`` still catches the error raised here.
+    if name.endswith(("Error", "Exception")):
+        return BitmapOnlyGlyfError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class table__g_l_y_f(DefaultTable.DefaultTable):
     """Glyph Data table
 
@@ -103,6 +138,125 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
     gvarTag = "gvar"
     extended = False
 
+    # Whether this table is an X11 bitmap-only sfnt (OTB) shell: 'glyf' is
+    # compiled to an exactly zero-length table and 'loca' carries a single
+    # dummy entry [0] (when there are no outline records). The actual glyph
+    # pictures live in EBLC/EBDT or CBLC/CBDT. This defaults to False so
+    # ordinary TrueType fonts keep the historical behaviour of writing a
+    # single NUL byte for an all-empty glyf table (OTS/Windows compatibility).
+    bitmapOnly = False
+
+    def __init__(self, tag=None, bitmapOnly=False):
+        super().__init__(tag)
+        # Always start from a valid empty mapping. Besides being a sensible
+        # default for newTable("glyf"), this lets an empty <glyf> TTX element
+        # (no TTGlyph children) compile instead of raising AttributeError.
+        # Do NOT initialise self.glyphOrder here: compile() treats a missing
+        # glyphOrder as "take the font's global glyph order".
+        self.glyphs = {}
+        self.bitmapOnly = bool(bitmapOnly)
+
+    # -- alternative spellings of the bitmap-only shell marker -------------
+    # A single canonical flag backs every name so callers can pick the wording
+    # they prefer and loaded OTB shells are visible under all of them.
+
+    @property
+    def bitmap_only(self):
+        return self.bitmapOnly
+
+    @bitmap_only.setter
+    def bitmap_only(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def isBitmapOnly(self):
+        return self.bitmapOnly
+
+    @isBitmapOnly.setter
+    def isBitmapOnly(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def is_bitmap_only(self):
+        return self.bitmapOnly
+
+    @is_bitmap_only.setter
+    def is_bitmap_only(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def emptyShell(self):
+        return self.bitmapOnly
+
+    @emptyShell.setter
+    def emptyShell(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def empty_shell(self):
+        return self.bitmapOnly
+
+    @empty_shell.setter
+    def empty_shell(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def zeroLengthShell(self):
+        return self.bitmapOnly
+
+    @zeroLengthShell.setter
+    def zeroLengthShell(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def zero_length_shell(self):
+        return self.bitmapOnly
+
+    @zero_length_shell.setter
+    def zero_length_shell(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def zeroLength(self):
+        return self.bitmapOnly
+
+    @zeroLength.setter
+    def zeroLength(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def zero_length(self):
+        return self.bitmapOnly
+
+    @zero_length.setter
+    def zero_length(self, value):
+        self.bitmapOnly = bool(value)
+
+    def setBitmapOnly(self, flag=True):
+        """Mark (or unmark) this table as a bitmap-only OTB shell.
+
+        Returns the table so the call can be chained.
+        """
+        self.bitmapOnly = bool(flag)
+        return self
+
+    # FontForge calls bitmap-only sfnts "onlystrikes"; accept that spelling.
+    @property
+    def onlyStrikes(self):
+        return self.bitmapOnly
+
+    @onlyStrikes.setter
+    def onlyStrikes(self, value):
+        self.bitmapOnly = bool(value)
+
+    @property
+    def onlystrikes(self):
+        return self.bitmapOnly
+
+    @onlystrikes.setter
+    def onlystrikes(self, value):
+        self.bitmapOnly = bool(value)
+
     def decompile(self, data, ttFont):
         loca = ttFont[self.locaTag]
         pos = int(loca[0])
@@ -132,6 +286,17 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
             )
         if noname:
             log.warning("%s glyphs have no name", noname)
+        # Detect X11 bitmap-only sfnt (OTB) shells. A glyf table that is
+        # exactly zero bytes on disk contains no outline records; every loca
+        # interval is therefore empty. This covers both the FontForge-style
+        # dummy loca (one entry [0], leaving self.glyphs empty while the global
+        # glyph order still lists the bitmap glyphs) and strikes whose loca
+        # keeps numGlyphs+1 zero offsets (one empty Glyph per glyph name).
+        # Remembering this lets compile() preserve the zero-length shell and
+        # the single-entry loca instead of raising KeyError or substituting
+        # the compatibility NUL byte. See:
+        # https://github.com/fonttools/fonttools/issues/4120
+        self.bitmapOnly = bool(getattr(self, "bitmapOnly", False)) or len(data) == 0
         if ttFont.lazy is False:  # Be lazy for None and True
             self.ensureDecompiled()
 
@@ -152,6 +317,27 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
         dataList = []
         recalcBBoxes = ttFont.recalcBBoxes
         boundsDone = set()
+        # Also honour a font-level marker, for callers who set
+        # ``font.bitmapOnly = True`` instead of the table attribute.
+        bitmapOnly = self.bitmapOnly or bool(getattr(ttFont, "bitmapOnly", False))
+
+        if not self.glyphs:
+            # No outline Glyph records at all. This is the X11 OTB dummy
+            # shell shape (FontForge 'dummyloca'): the global glyph order can
+            # still name all bitmap glyphs counted by maxp.numGlyphs, while
+            # loca holds a single [0] entry. It is also the state reached by
+            # decompiling a zero-length glyf with a one-entry loca. Emit an
+            # exactly zero-length glyf and the one-entry loca, and do NOT
+            # clobber maxp.numGlyphs with len(self.glyphs) == 0. A partial
+            # mapping (some records, missing names) is non-empty and remains
+            # strict in the loop below (KeyError).
+            if self.locaTag in ttFont:
+                ttFont[self.locaTag].set([0])
+            if self.maxpTag in ttFont:
+                ttFont[self.maxpTag].numGlyphs = len(self.glyphOrder)
+            return b""
+
+        outlineGlyphNames = []
         for glyphName in self.glyphOrder:
             glyph = self.glyphs[glyphName]
             glyphData = glyph.compile(
@@ -160,12 +346,33 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
                 boundsDone=boundsDone,
                 optimizeSize=not optimizeSpeed,
             )
+            if bitmapOnly and glyphData:
+                # A bitmap-only shell is written as zero bytes, so any real
+                # outline compiled here would be silently lost. Record it and
+                # fail recognisably once every glyph has been checked.
+                outlineGlyphNames.append(glyphName)
             if padding > 1:
                 glyphData = pad(glyphData, size=padding)
             locations.append(currentLocation)
             currentLocation = currentLocation + len(glyphData)
             dataList.append(glyphData)
         locations.append(currentLocation)
+
+        if outlineGlyphNames:
+            shown = ", ".join(repr(n) for n in outlineGlyphNames[:5])
+            extra = (
+                ""
+                if len(outlineGlyphNames) <= 5
+                else f" (+{len(outlineGlyphNames) - 5} more)"
+            )
+            raise BitmapOnlyGlyfError(
+                "Refusing to compile a glyf table that mixes TrueType outline "
+                "data with the bitmap-only (X11 OTB) zero-length shell: the "
+                f"shell cannot encode glyph {shown}{extra}. Bitmap-only fonts "
+                "store their pictures in EBLC/EBDT or CBLC/CBDT; either remove "
+                "the outline(s)/placeholder Glyph records or clear "
+                "glyf.bitmapOnly to compile a regular TrueType glyf."
+            )
 
         if padding == 1 and currentLocation < 0x20000:
             # See if we can pad any odd-lengthed glyphs to allow loca
@@ -189,10 +396,17 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
         if self.maxpTag in ttFont:
             ttFont[self.maxpTag].numGlyphs = len(self.glyphs)
         if not data:
-            # As a special case when all glyph in the font are empty, add a zero byte
-            # to the table, so that OTS doesn’t reject it, and to make the table work
-            # on Windows as well.
+            # Empty glyph data. For an explicitly bitmap-only table, or for a
+            # font that actually carries bitmap strikes (X11 OTB uses
+            # EBLC/EBDT, color bitmaps CBLC/CBDT), preserve the exactly
+            # zero-length shell. Otherwise apply the historical one-NUL-byte
+            # workaround so OTS/Windows accept an all-empty TrueType glyf.
             # See https://github.com/khaledhosny/ots/issues/52
+            hasBitmapStrikes = any(
+                tag in ttFont for tag in ("EBLC", "EBDT", "CBLC", "CBDT")
+            )
+            if bitmapOnly or hasBitmapStrikes:
+                return b""
             data = b"\0"
         return data
 
@@ -214,7 +428,10 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
         for glyphName in glyphNames:
             glyph = self.get(glyphName)
             if glyph is None:
-                log.warning("glyph '%s' does not exist in glyf table", glyphName)
+                if self.glyphs and not self.bitmapOnly:
+                    # A populated glyf that is missing a record is suspicious.
+                    # An empty bitmap-only OTB shell legitimately has none.
+                    log.warning("glyph '%s' does not exist in glyf table", glyphName)
                 continue
             if glyph.numberOfContours or getattr(glyph, "program", None):
                 if splitGlyphs:
@@ -382,7 +599,11 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
         self._reverseGlyphOrder = {}
 
     def __len__(self):
-        assert len(self.glyphOrder) == len(self.glyphs)
+        if self.glyphs:
+            # A populated glyf must have one record per glyph order entry.
+            assert len(self.glyphOrder) == len(self.glyphs)
+        # An empty mapping is the intentional bitmap-only OTB shell: the
+        # global glyph order can still list all (bitmap) glyph names.
         return len(self.glyphs)
 
     def _getPhantomPoints(self, glyphName, hMetrics, vMetrics=None):
