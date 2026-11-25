@@ -1,3 +1,18 @@
+4.66.2 (unreleased)
+-------------------
+
+- [varLib] Add single-axis reverse lookup of ``avar`` v1 segment mappings.
+  ``varLib.models.reversePiecewiseLinearMap`` returns every preimage of a
+  target value under a piecewise-linear map — point or interval solutions —
+  handling non-monotone segments, plateaus, coincident endpoints, clipping and
+  unreachable targets, with results sorted, de-duplicated and explained. The
+  new ``varLib.avar.reverse_map`` module exposes ``reverseMap`` (with fvar
+  normalized/user-unit conversion and explicit errors for missing fvar,
+  avar v2 tables and multi-axis input) plus ``verifySolutions``/``verifyResult``
+  forward checks, and a matching ``fonttools varLib.avar.reverse_map``
+  command-line tool (``--verify`` re-runs every solution through the forward
+  mapping and reports the error).
+
 4.66.1 (released 2026-09-29)
 ----------------------------
 

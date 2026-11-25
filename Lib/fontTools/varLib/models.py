@@ -7,10 +7,14 @@ __all__ = [
     "normalizeLocation",
     "supportScalar",
     "piecewiseLinearMap",
+    "ReverseSolution",
+    "ReverseMapResult",
+    "reversePiecewiseLinearMap",
     "VariationModel",
 ]
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from fontTools.misc.roundTools import noRound
 from .errors import VariationModelError
@@ -619,6 +623,405 @@ def piecewiseLinearMap(v: float, mapping: Mapping[float, float]) -> float:
     va = mapping[a]
     vb = mapping[b]
     return va + (vb - va) * (v - a) / (b - a)
+
+
+# Tolerance used by reversePiecewiseLinearMap to snap computed points onto
+# mapping knots and to merge coincident solutions.  This is on the normalized
+# (-1..1) coordinate scale used by avar, where 1e-12 is far below the F2Dot14
+# quantization step (~6.1e-5) and still safely above ordinary float noise.
+REVERSE_MAP_EPS = 1e-12
+
+
+@dataclass(frozen=True)
+class ReverseSolution:
+    """One preimage of a target value under a piecewise-linear map.
+
+    A solution is either a single input point (``kind == "point"``) or a
+    closed input interval (``kind == "interval"``).  Intervals arise from
+    flat segments of the mapping: every input inside
+    ``[intervalStart, intervalEnd]`` maps to the same output, so the whole
+    interval is a valid answer and no unique input exists.
+
+    Attributes:
+        kind: ``"point"`` or ``"interval"``.
+        value: the input value (point solutions only; ``None`` otherwise).
+        intervalStart/intervalEnd: inclusive input bounds (interval
+            solutions only; ``None`` otherwise).
+        explanation: human-readable description of which segment produced
+            the solution, expressed in the same (normalized) coordinates
+            as the mapping.
+        segmentIndex: index of the responsible mapping segment, or
+            ``None`` for extrapolation tails and identity maps.
+    """
+
+    kind: str
+    explanation: str
+    value: float | None = None
+    intervalStart: float | None = None
+    intervalEnd: float | None = None
+    segmentIndex: int | None = None
+
+    @property
+    def isInterval(self) -> bool:
+        return self.kind == "interval"
+
+
+@dataclass(frozen=True)
+class ReverseMapResult:
+    """Result of a reverse lookup on a piecewise-linear map.
+
+    Attributes:
+        target: the requested output value.
+        solutions: all distinct preimages, sorted by input position.
+        reachable: whether the target is reached by at least one input.
+        reason: when ``reachable`` is false, an explanation of why no
+            preimage exists; otherwise an empty string.
+        reachableRange: the map's overall output range ``(low, high)``
+            over its key domain (a single interval, since a continuous
+            map on an interval has a connected image); ``None`` for an
+            empty mapping.
+        domain: input interval ``[low, high]`` covered by the mapping
+            keys, or ``None`` for an empty (identity) mapping.
+        clip: whether the search was restricted to ``domain``.  When
+            false, slope-1 extrapolation outside the outermost keys is
+            also considered.
+        unit: ``"normalized"`` for the math-level function; font-level
+            wrappers rewrite this to ``"user"`` after denormalization.
+        axis: optional axis tag, set by font-level wrappers.
+    """
+
+    target: float
+    solutions: list[ReverseSolution]
+    reachable: bool
+    reason: str = ""
+    reachableRange: tuple[float, float] | None = None
+    domain: tuple[float, float] | None = None
+    clip: bool = True
+    unit: str = "normalized"
+    axis: str | None = None
+
+    @property
+    def points(self) -> list[ReverseSolution]:
+        return [s for s in self.solutions if not s.isInterval]
+
+    @property
+    def intervals(self) -> list[ReverseSolution]:
+        return [s for s in self.solutions if s.isInterval]
+
+
+def _mergeRanges(
+    ranges: list[tuple[float, float]], eps: float
+) -> tuple[float, float] | None:
+    """Return the hull ``(low, high)`` of closed ``(low, high)`` ranges.
+
+    A continuous piecewise-linear map on an interval has a connected
+    image, so the per-segment output ranges always join into one
+    interval; the eps-tolerant merge documents that rather than relying
+    on it silently.
+    """
+    if not ranges:
+        return None
+    merged: list[tuple[float, float]] = []
+    for low, high in sorted(ranges):
+        if merged and low <= merged[-1][1] + eps:
+            prevLow, prevHigh = merged[-1]
+            merged[-1] = (prevLow, max(prevHigh, high))
+        else:
+            merged.append((low, high))
+    return merged[0][0], merged[-1][1]
+
+
+def reversePiecewiseLinearMap(
+    target: float,
+    mapping: Mapping[float, float],
+    *,
+    clip: bool = True,
+    eps: float = REVERSE_MAP_EPS,
+) -> ReverseMapResult:
+    """Find every input ``x`` such that ``piecewiseLinearMap(x, mapping) == target``.
+
+    The mapping is treated as a continuous piecewise-linear function of
+    one variable, which covers non-monotone mappings (the same target can
+    be reached several times), flat segments (whole interval preimages),
+    repeated endpoint values, and arbitrary key/value orders.
+
+    By default (``clip=True``) the search is restricted to the closed
+    domain spanned by the mapping keys, matching the normalized -1..1
+    range of an ``avar`` axis: a target outside the map's output range
+    yields an unreachable result.  With ``clip=False`` the slope-1
+    extrapolation used by :func:`piecewiseLinearMap` outside the
+    outermost keys is also inverted, so every target is reachable except
+    those falling into an interior output-range gap of a non-monotone
+    map.
+
+    An empty mapping is the identity map, whose preimage is the target
+    itself.
+
+    Returned solutions are de-duplicated, sorted by input position, and
+    each carries an :attr:`ReverseSolution.explanation` string.
+
+    >>> mapping = {-1.0: -1.0, 0.0: 0.0, 0.25: 0.5, 0.5: 0.5, 1.0: 1.0}
+    >>> result = reversePiecewiseLinearMap(0.5, mapping)
+    >>> [(s.kind, s.value, s.intervalStart, s.intervalEnd) for s in result.solutions]
+    [('interval', None, 0.25, 0.5)]
+    >>> reversePiecewiseLinearMap(0.75, mapping).points[0].value
+    0.75
+    >>> reversePiecewiseLinearMap(1.5, mapping).reachable
+    False
+    """
+    # Empty mapping: identity.  piecewiseLinearMap(v, {}) == v for every v.
+    if not mapping:
+        point = ReverseSolution(
+            kind="point",
+            value=target,
+            explanation="empty (identity) mapping: the preimage is the target itself",
+        )
+        return ReverseMapResult(
+            target=target,
+            solutions=[point],
+            reachable=True,
+            reachableRange=None,
+            domain=None,
+            clip=clip,
+        )
+
+    items = sorted(mapping.items())
+    keys = [k for k, _ in items]
+    values = [v for _, v in items]
+    xMin, xMax = keys[0], keys[-1]
+
+    # Single-key mapping: one input point maps to one output value.
+    if len(items) == 1:
+        x0, y0 = items[0]
+        if abs(target - y0) <= eps:
+            point = ReverseSolution(
+                kind="point",
+                value=x0,
+                explanation=f"single-key mapping: only {x0:g} maps to {y0:g}",
+            )
+            return ReverseMapResult(
+                target=target,
+                solutions=[point],
+                reachable=True,
+                reachableRange=(y0, y0),
+                domain=(x0, x0),
+                clip=clip,
+            )
+        if not clip:
+            # Slope-1 extrapolation on both sides of the lone key.
+            tailX = target + x0 - y0
+            point = ReverseSolution(
+                kind="point",
+                value=tailX,
+                explanation=(
+                    f"extrapolated from the single key {x0:g} -> {y0:g} "
+                    f"(slope-1 tail)"
+                ),
+            )
+            return ReverseMapResult(
+                target=target,
+                solutions=[point],
+                reachable=True,
+                reachableRange=(y0, y0),
+                domain=(x0, x0),
+                clip=False,
+            )
+        reason = (
+            f"target {target:g} is not reached by the single-key mapping; "
+            f"the only reachable output is {y0:g} at input {x0:g}"
+        )
+        return ReverseMapResult(
+            target=target,
+            solutions=[],
+            reachable=False,
+            reason=reason,
+            reachableRange=(y0, y0),
+            domain=(x0, x0),
+            clip=clip,
+        )
+
+    # Reachable output ranges of the interior segments, merged.
+    ranges: list[tuple[float, float]] = []
+    for i in range(len(items) - 1):
+        lo, hi = values[i], values[i + 1]
+        if lo > hi:
+            lo, hi = hi, lo
+        ranges.append((lo, hi))
+    reachableRange = _mergeRanges(ranges, eps)
+
+    # Raw preimages.  Points carry an atBoundary flag: True when the target
+    # is reached at a segment endpoint (a mapping knot), False for the
+    # interior of a sloped segment.  The flag decides how a point merges
+    # with a flat segment's interval later on.
+    rawPoints: list[tuple[float, bool, str, int | None]] = []
+    rawIntervals: list[tuple[float, float, str, int]] = []
+
+    def addPoint(
+        x: float, atBoundary: bool, explanation: str, segmentIndex: int | None
+    ) -> None:
+        for k, (px, pb, pe, ps) in enumerate(rawPoints):
+            if abs(px - x) <= eps:
+                # Keep one entry; the boundary flag is the OR of the two:
+                # a knot reached from a flat side and a sloped side is both.
+                rawPoints[k] = (px, pb or atBoundary, f"{pe}; also {explanation}", ps)
+                return
+        rawPoints.append((x, atBoundary, explanation, segmentIndex))
+
+    def addInterval(lo: float, hi: float, explanation: str, segmentIndex: int) -> None:
+        if hi < lo:
+            lo, hi = hi, lo
+        rawIntervals.append((lo, hi, explanation, segmentIndex))
+
+    # Interior segments, including zero-length ones (duplicate keys).
+    for i in range(len(items) - 1):
+        a, va = keys[i], values[i]
+        b, vb = keys[i + 1], values[i + 1]
+        lo, hi = (va, vb) if va <= vb else (vb, va)
+
+        if abs(vb - va) <= eps:
+            # Flat (or numerically degenerate) segment: interval preimage.
+            if lo - eps <= target <= hi + eps:
+                addInterval(
+                    a,
+                    b,
+                    f"flat segment #{i} [{a:g}, {b:g}] maps every input to {va:g}",
+                    i,
+                )
+            continue
+
+        if not (lo - eps <= target <= hi + eps):
+            continue
+
+        x = a + (target - va) * (b - a) / (vb - va)
+        # Numerical safety for the segment's input bounds.
+        x = min(max(x, min(a, b)), max(a, b))
+        atBoundary = abs(target - va) <= eps or abs(target - vb) <= eps
+        addPoint(
+            x,
+            atBoundary,
+            f"interpolated on segment #{i} [{a:g}, {b:g}] -> [{va:g}, {vb:g}]",
+            i,
+        )
+
+    # Extrapolation tails.  piecewiseLinearMap continues outside [xMin, xMax]
+    # with slope 1: f(x) = x + yEnd - xEnd.  Inverting gives x = target + xEnd - yEnd.
+    if not clip:
+        x0, y0 = keys[0], values[0]
+        tailX = target + x0 - y0
+        if tailX <= xMin + eps:
+            addPoint(
+                min(tailX, xMin),
+                abs(tailX - xMin) <= eps,
+                f"extrapolated below the first key {x0:g} (slope-1 tail)",
+                None,
+            )
+        xN, yN = keys[-1], values[-1]
+        tailX = target + xN - yN
+        if tailX >= xMax - eps:
+            addPoint(
+                max(tailX, xMax),
+                abs(tailX - xMax) <= eps,
+                f"extrapolated above the last key {xN:g} (slope-1 tail)",
+                None,
+            )
+
+    # Normalize intervals first: merge flat segments that touch or overlap
+    # (adjacent flat segments sharing a knot and mapping to the same output
+    # form one continuous preimage).
+    normIntervals: list[list] = []
+    for ivLo, ivHi, expl, segIdx in sorted(rawIntervals):
+        if normIntervals and ivLo <= normIntervals[-1][1] + eps:
+            prev = normIntervals[-1]
+            prev[1] = max(prev[1], ivHi)
+            prev[2] = f"{prev[2]}; also {expl}"
+        else:
+            normIntervals.append([ivLo, ivHi, expl, segIdx])
+
+    # Fold point preimages into the normalized intervals:
+    #  - a boundary point (mapping knot) inside or on an interval already
+    #    belongs to the flat segment -> drop it;
+    #  - an interior point of a sloped segment touching an interval's outer
+    #    edge extends the interval, because the sloped segment keeps mapping
+    #    to the target beyond the knot (flat [0.25, 0.5] + sloped point 0.75
+    #    -> interval [0.25, 0.75]);
+    #  - anything else survives as a point solution.
+    keptPoints: list[tuple[float, bool, str, int | None]] = []
+    sortedPoints: list[tuple[float, bool, str, int | None]] = sorted(
+        rawPoints, key=lambda p: p[0]
+    )
+    ptRecord: tuple[float, bool, str, int | None]
+    for ptRecord in sortedPoints:
+        x, atBoundary, expl, pointSegIdx = ptRecord
+        matched = False
+        for iv in normIntervals:
+            ivLo, ivHi = iv[0], iv[1]
+            if x < ivLo - eps or x > ivHi + eps:
+                continue
+            if not atBoundary and x > ivHi:
+                iv[1] = x
+                iv[2] = f"{iv[2]}; also {expl}"
+            elif not atBoundary and x < ivLo:
+                iv[0] = x
+                iv[2] = f"{iv[2]}; also {expl}"
+            # else: boundary knot already covered, or interior point inside
+            # the flat segment -> redundant, drop.
+            matched = True
+            break
+        if not matched:
+            keptPoints.append((x, atBoundary, expl, pointSegIdx))
+
+    solutions: list[ReverseSolution] = [
+        ReverseSolution(
+            kind="point",
+            value=x,
+            explanation=expl,
+            segmentIndex=segIdx,
+        )
+        for x, _atBoundary, expl, segIdx in keptPoints
+    ]
+    solutions += [
+        ReverseSolution(
+            kind="interval",
+            intervalStart=ivLo,
+            intervalEnd=ivHi,
+            explanation=expl,
+            segmentIndex=segIdx,
+        )
+        for ivLo, ivHi, expl, segIdx in normIntervals
+    ]
+    solutions.sort(
+        key=lambda s: (
+            s.intervalStart if s.isInterval else s.value,
+            s.intervalEnd if s.isInterval else s.value,
+        )
+    )
+
+    reason = ""
+    reachable = bool(solutions)
+    if not reachable:
+        # With clip=False the slope-1 extrapolation tails cover every target
+        # outside the key domain, so an unreachable target can only mean the
+        # request was clipped to the key domain.  At least two mapping keys
+        # exist at this point (empty/single-key mappings returned earlier),
+        # hence the output range is always defined.
+        assert reachableRange is not None
+        rLo, rHi = reachableRange
+        reason = (
+            f"target {target:g} is not reached by any input in the mapping "
+            f"domain [{xMin:g}, {xMax:g}]; the map's output range over that "
+            f"domain is [{rLo:g}, {rHi:g}]. Pass clip=False to also invert "
+            f"the slope-1 extrapolation outside the mapping keys."
+        )
+
+    return ReverseMapResult(
+        target=target,
+        solutions=solutions,
+        reachable=reachable,
+        reason=reason,
+        reachableRange=reachableRange,
+        domain=(xMin, xMax),
+        clip=clip,
+    )
 
 
 def main(args=None):
