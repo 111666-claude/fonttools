@@ -1263,11 +1263,13 @@ def parseBlendList(s):
         if isinstance(element, str):
             continue
         name, attrs, content = element
-        blendList = attrs["value"].split()
-        blendList = [safeEval(val) for val in blendList]
-        valueList.append(blendList)
-    if len(valueList) == 1:
-        valueList = valueList[0]
+        if name == kBlendDictOpName:
+            blendList = attrs["value"].split()
+            blendList = [safeEval(val) for val in blendList]
+            valueList.append(blendList)
+        elif name == "num":
+            # A constant (non-blended) value in a delta array.
+            valueList.append(parseNum(attrs["value"]))
     return valueList
 
 
@@ -1291,6 +1293,8 @@ class NumberConverter(SimpleConverter):
         valueString = attrs.get("value", None)
         if valueString is None:
             value = parseBlendList(content)
+            if len(value) == 1:
+                value = value[0]
         else:
             value = parseNum(attrs["value"])
         return value
@@ -1298,13 +1302,17 @@ class NumberConverter(SimpleConverter):
 
 class ArrayConverter(SimpleConverter):
     def xmlWrite(self, xmlWriter, name, value):
-        if value and isinstance(value[0], list):
+        if value and any(isinstance(val, list) for val in value):
             xmlWriter.begintag(name)
             xmlWriter.newline()
             xmlWriter.indent()
             for valueList in value:
-                blendValue = " ".join([str(val) for val in valueList])
-                xmlWriter.simpletag(kBlendDictOpName, value=blendValue)
+                if isinstance(valueList, list):
+                    blendValue = " ".join([str(val) for val in valueList])
+                    xmlWriter.simpletag(kBlendDictOpName, value=blendValue)
+                else:
+                    # A constant (non-blended) value in a delta array.
+                    xmlWriter.simpletag("num", value=valueList)
                 xmlWriter.newline()
             xmlWriter.dedent()
             xmlWriter.endtag(name)
@@ -2251,8 +2259,7 @@ class DictCompiler(object):
     def arg_delta(self, value):
         if not value:
             return b""
-        val0 = value[0]
-        if isinstance(val0, list):
+        if any(isinstance(v, list) for v in value):
             data = self.arg_delta_blend(value)
         else:
             out = []
@@ -2266,73 +2273,114 @@ class DictCompiler(object):
         return bytesjoin(data)
 
     def arg_delta_blend(self, value):
-        """A delta list with blend lists has to be *all* blend lists.
+        """A delta list may mix constant values and blend lists.
 
-        The value is a list is arranged as follows::
+        The value is a list of items. A constant item is a plain number: the
+        absolute coordinate value from the default font. A blend item is a
+        list arranged as follows::
 
-                [
-                        [V0, d0..dn]
-                        [V1, d0..dn]
-                        ...
-                        [Vm, d0..dn]
-                ]
+                [V, d0..dn]
 
-        ``V`` is the absolute coordinate value from the default font, and ``d0-dn``
-        are the delta values from the *n* regions. Each ``V`` is an absolute
-        coordinate from the default font.
+        ``V`` is the absolute coordinate value from the default font, and
+        ``d0-dn`` are the delta values from the *n* regions.
 
-        We want to return a list::
+        Consecutive blend items are emitted as blend groups::
 
                 [
-                        [v0, v1..vm]
-                        [d0..dn]
+                        v0, v1..vm
+                        d0..dn
                         ...
-                        [d0..dn]
+                        d0..dn
                         numBlends
                         blendOp
                 ]
 
-        where each ``v`` is relative to the previous default font value.
+        where each ``v`` is relative to the previous default font value. The
+        delta encoding chain is kept continuous across blend groups and
+        constants: the first default value of a group is relative to the
+        last default value emitted before it, not to zero.
+
+        A blend group of *m* values needs ``m * numMasters + 1`` operand
+        stack slots, on top of the values already pushed by preceding
+        constants and blend groups (their results stay on the stack until
+        the dict operator is reached). Groups are split so that the stack
+        never exceeds ``self.maxBlendStack``. A ``ValueError`` is raised if
+        the value cannot be encoded within the stack limit.
         """
-        numMasters = len(value[0])
-        numBlends = len(value)
-        numStack = (numBlends * numMasters) + 1
-        if numStack > self.maxBlendStack:
-            # Figure out the max number of value we can blend
-            # and divide this list up into chunks of that size.
-
-            numBlendValues = int((self.maxBlendStack - 1) / numMasters)
-            out = []
-            while True:
-                numVal = min(len(value), numBlendValues)
-                if numVal == 0:
-                    break
-                valList = value[0:numVal]
-                out1 = self.arg_delta_blend(valList)
-                out.extend(out1)
-                value = value[numVal:]
-        else:
-            firstList = [0] * numBlends
-            deltaList = [None] * numBlends
-            i = 0
-            prevVal = 0
-            while i < numBlends:
-                # For PrivateDict BlueValues, the default font
-                # values are absolute, not relative.
-                # Must convert these back to relative coordinates
-                # before writing to CFF2.
-                defaultValue = value[i][0]
-                firstList[i] = defaultValue - prevVal
-                prevVal = defaultValue
-                deltaList[i] = value[i][1:]
+        numMasters = None
+        for v in value:
+            if isinstance(v, list):
+                if numMasters is None:
+                    numMasters = len(v)
+                elif len(v) != numMasters:
+                    raise ValueError(
+                        "All blend lists in a CFF2 Private DICT delta value "
+                        "must have the same number of masters."
+                    )
+        out = []
+        stackDepth = 0  # values left on the operand stack so far
+        prevVal = 0  # absolute default-font value of the previous item
+        i = 0
+        numItems = len(value)
+        while i < numItems:
+            item = value[i]
+            if not isinstance(item, list):
+                # A constant: encode relative to the previous absolute value.
+                out.append(encodeNumber(item - prevVal))
+                prevVal = item
+                stackDepth += 1
                 i += 1
+                continue
+            # Emit the run of consecutive blend lists, splitting it into
+            # groups that fit within the remaining operand stack space.
+            # Each emitted blend result stays on the stack, so less room
+            # is left for each following group.
+            j = i
+            while j < numItems and isinstance(value[j], list):
+                j += 1
+            while i < j:
+                maxBlends = (self.maxBlendStack - 1 - stackDepth) // numMasters
+                if maxBlends < 1:
+                    raise ValueError(
+                        "Cannot encode CFF2 Private DICT blend arguments: "
+                        "the operand stack limit of %d values is exceeded "
+                        "(%d values already on the stack, %d needed per "
+                        "blend value)." % (self.maxBlendStack, stackDepth, numMasters)
+                    )
+                numVal = min(j - i, maxBlends)
+                out.extend(self._encode_blend_group(value[i : i + numVal], prevVal))
+                prevVal = value[i + numVal - 1][0]
+                stackDepth += numVal
+                i += numVal
+        return out
 
-            relValueList = firstList
-            for blendList in deltaList:
-                relValueList.extend(blendList)
-            out = [encodeNumber(val) for val in relValueList]
-            out.append(encodeNumber(numBlends))
-            out.append(bytechr(blendOp))
+    @staticmethod
+    def _encode_blend_group(blendLists, prevVal):
+        """Encode one blend group.
+
+        ``blendLists`` is a non-empty list of ``[V, d0..dn]`` blend lists and
+        ``prevVal`` the absolute default-font value of the item preceding the
+        group. Returns a list of encoded operands followed by the blend op.
+        """
+        numBlends = len(blendLists)
+        firstList = [0] * numBlends
+        deltaList = [None] * numBlends
+        for i, blendList in enumerate(blendLists):
+            # For PrivateDict BlueValues, the default font
+            # values are absolute, not relative.
+            # Must convert these back to relative coordinates
+            # before writing to CFF2.
+            defaultValue = blendList[0]
+            firstList[i] = defaultValue - prevVal
+            prevVal = defaultValue
+            deltaList[i] = blendList[1:]
+
+        relValueList = firstList
+        for blendList in deltaList:
+            relValueList.extend(blendList)
+        out = [encodeNumber(val) for val in relValueList]
+        out.append(encodeNumber(numBlends))
+        out.append(bytechr(blendOp))
         return out
 
 

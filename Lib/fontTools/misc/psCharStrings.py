@@ -319,6 +319,10 @@ class CharStringCompileError(Exception):
     pass
 
 
+class CFFDictReadError(Exception):
+    pass
+
+
 class SimpleT2Decompiler(object):
     def __init__(self, localSubrs, globalSubrs, private=None, blender=None):
         self.localSubrs = localSubrs
@@ -1454,29 +1458,52 @@ class DictDecompiler(object):
 
     def arg_blendList(self, name):
         """
-        There may be non-blend args at the top of the stack. We first calculate
-        where the blend args start in the stack. These are the last
-        numMasters*numBlends) +1 args.
-        The blend args starts with numMasters relative coordinate values, the  BlueValues in the list from the default master font. This is followed by
-        numBlends list of values. Each of  value in one of these lists is the
-        Variable Font delta for the matching region.
+        There may be non-blend args on the stack below the blend args:
+        constants and the results of previous blend groups stay on the
+        stack until the dict operator is reached. The blend args for this
+        blend operation are the last (numMasters*numBlends) values on the
+        stack.
 
-        We re-arrange this to be a list of numMaster entries. Each entry starts with the corresponding default font relative value, and is followed by
-        the delta values. We then convert the default values, the first item in each entry, to an absolute value.
+        The blend args start with numBlends relative coordinate values,
+        e.g. the BlueValues in the list from the default master font. These
+        are followed by numBlends * (numMasters - 1) delta values for the
+        matching regions.
+
+        We re-arrange this to be a list of numBlends entries. Each entry
+        starts with the corresponding default font value and is followed by
+        the delta values. The default values are delta-encoded relative to
+        the previous value in the array — which may be a constant or the
+        result of a previous blend group — so we convert them to absolute
+        values using the values already on the stack.
         """
         vsindex = self.dict.get("vsindex", 0)
         numMasters = (
             self.parent.getNumRegions(vsindex) + 1
         )  # only a PrivateDict has blended ops.
         numBlends = self.pop()
-        args = self.popall()
-        numArgs = len(args)
-        # The spec says that there should be no non-blended Blue Values,.
-        assert numArgs == numMasters * numBlends
+        numArgs = numMasters * numBlends
+        if len(self.stack) < numArgs:
+            raise CFFDictReadError(
+                "blend operator expects %d args, only %d on the stack"
+                % (numArgs, len(self.stack))
+            )
+        if numArgs:
+            args = self.stack[-numArgs:]
+            del self.stack[-numArgs:]
+        else:
+            args = []
+        # Compute the absolute default-font value preceding this blend
+        # group: constants are still delta-encoded, while the results of
+        # previous blend groups were already converted to absolute values.
+        prevVal = 0
+        for arg in self.stack:
+            if isinstance(arg, list):
+                prevVal = arg[0]
+            else:
+                prevVal += arg
         value = [None] * numBlends
         numDeltas = numMasters - 1
         i = 0
-        prevVal = 0
         while i < numBlends:
             newVal = args[i] + prevVal
             prevVal = newVal
@@ -1489,12 +1516,14 @@ class DictDecompiler(object):
     def arg_delta(self, name):
         valueList = self.popall()
         out = []
-        if valueList and isinstance(valueList[0], list):
-            # arg_blendList() has already converted these to absolute values.
-            out = valueList
-        else:
-            current = 0
-            for v in valueList:
+        current = 0
+        for v in valueList:
+            if isinstance(v, list):
+                # arg_blendList() has already converted these to absolute
+                # values.
+                current = v[0]
+                out.append(v)
+            else:
                 current = current + v
                 out.append(current)
         return out
