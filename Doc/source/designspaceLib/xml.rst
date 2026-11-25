@@ -757,11 +757,20 @@ The ``<variable-fonts>`` element contains one or more ``<variable-font>`` elemen
      an absolute or relative path. Build tools will only use the basename
      component and ignore any directory separators for security reasons.
 
+- ``familyname``: string, optional. The family name of the built variable
+  font. When set, build tools write it to the font's family name records
+  (name IDs 1 and 16) and rebuild the full font name (ID 4) and PostScript
+  name (ID 6) accordingly; when omitted, the variable font keeps inheriting
+  the family name of the default source. Localised family names can be added
+  with child ``<familyname>`` elements carrying an ``xml:lang`` attribute,
+  exactly like on ``<source>`` elements.
+
 .. rubric:: Example
 
 .. code:: xml
 
-    <variable-font name="MyFontVF_Italic">
+    <variable-font name="MyFontVF_Italic" familyname="My Font Italic">
+      <familyname xml:lang="fr">Ma Police Italique</familyname>
       <axis-subsets>
         <axis-subset name="Weight"/>
         <axis-subset name="Italic" uservalue="1"/>

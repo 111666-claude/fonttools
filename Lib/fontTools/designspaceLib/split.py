@@ -358,6 +358,8 @@ def _extractSubSpace(
                             for axisSubset in vf.axisSubsets
                             if isinstance(userRegion[axisSubset.name], Range)
                         ],
+                        familyName=vf.familyName,
+                        localisedFamilyName=dict(vf.localisedFamilyName),
                         lib=vf.lib,
                     )
                 )

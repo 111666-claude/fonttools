@@ -1350,11 +1350,27 @@ class VariableFontDescriptor(SimpleDescriptor):
     """
 
     flavor = "variable-font"
-    _attrs = ("filename", "axisSubsets", "lib")
+    _attrs = (
+        "name",
+        "filename",
+        "axisSubsets",
+        "familyName",
+        "localisedFamilyName",
+        "lib",
+    )
 
     filename = posixpath_property("_filename")
 
-    def __init__(self, *, name, filename=None, axisSubsets=None, lib=None):
+    def __init__(
+        self,
+        *,
+        name,
+        filename=None,
+        axisSubsets=None,
+        familyName=None,
+        localisedFamilyName=None,
+        lib=None,
+    ):
         self.name: str = name
         """string, required. Name of this variable to identify it during the
         build process and from other parts of the document, and also as a
@@ -1381,8 +1397,36 @@ class VariableFontDescriptor(SimpleDescriptor):
         If an axis is not mentioned, assume that we only want the default
         location of that axis (same as a :class:`ValueAxisSubsetDescriptor`).
         """
+        self.familyName: Optional[str] = familyName
+        """string, optional. Family name of the variable font. If set, it is
+        written to the font's ``name`` table when building, instead of the
+        family name inherited from the default source.
+
+        .. versionadded:: 5.2
+        """
+        self.localisedFamilyName: Dict[str, str] = localisedFamilyName or {}
+        """dict. A dictionary of localised family name strings, keyed by
+        language code. Used together with :attr:`familyName` to write the
+        localized family name records of the built font.
+
+        .. versionadded:: 5.2
+        """
         self.lib: MutableMapping[str, Any] = lib or {}
         """Custom data associated with this variable font."""
+
+    def setFamilyName(self, familyName, languageCode="en"):
+        """Setter for :attr:`localisedFamilyName`
+
+        .. versionadded:: 5.2
+        """
+        self.localisedFamilyName[languageCode] = tostr(familyName)
+
+    def getFamilyName(self, languageCode="en"):
+        """Getter for :attr:`localisedFamilyName`
+
+        .. versionadded:: 5.2
+        """
+        return self.localisedFamilyName.get(languageCode)
 
 
 class RangeAxisSubsetDescriptor(SimpleDescriptor):
@@ -1931,6 +1975,18 @@ class BaseDocWriter(object):
         vfElement.attrib["name"] = vf.name
         if vf.filename is not None:
             vfElement.attrib["filename"] = vf.filename
+        if vf.familyName is not None:
+            vfElement.attrib["familyname"] = vf.familyName
+        if vf.localisedFamilyName:
+            languageCodes = list(vf.localisedFamilyName.keys())
+            languageCodes.sort()
+            for code in languageCodes:
+                if code == "en":
+                    continue  # already stored in the element attribute
+                localisedFamilyNameElement = ET.Element("familyname")
+                localisedFamilyNameElement.attrib[XML_LANG] = code
+                localisedFamilyNameElement.text = vf.getFamilyName(code)
+                vfElement.append(localisedFamilyNameElement)
         if vf.axisSubsets:
             subsetsElement = ET.Element("axis-subsets")
             for subset in vf.axisSubsets:
@@ -2285,7 +2341,7 @@ class BaseDocReader(LogMixin):
         if self.documentObject.formatTuple < (5, 0):
             return
 
-        xml_attrs = {"name", "filename"}
+        xml_attrs = {"name", "filename", "familyname"}
         for variableFontElement in self.root.findall(".variable-fonts/variable-font"):
             unknown_attrs = set(variableFontElement.attrib) - xml_attrs
             if unknown_attrs:
@@ -2300,6 +2356,17 @@ class BaseDocReader(LogMixin):
                 )
 
             filename = variableFontElement.get("filename")
+
+            familyName = variableFontElement.get("familyname")
+            localisedFamilyName = None
+            if familyName is not None:
+                localisedFamilyName = {"en": familyName}
+            for familyNameElement in variableFontElement.findall("familyname"):
+                for key, lang in familyNameElement.items():
+                    if key == XML_LANG:
+                        if localisedFamilyName is None:
+                            localisedFamilyName = {}
+                        localisedFamilyName[lang] = familyNameElement.text
 
             axisSubsetsElement = variableFontElement.find(".axis-subsets")
             if axisSubsetsElement is None:
@@ -2319,6 +2386,8 @@ class BaseDocReader(LogMixin):
                 name=name,
                 filename=filename,
                 axisSubsets=axisSubsets,
+                familyName=familyName,
+                localisedFamilyName=localisedFamilyName,
                 lib=lib,
             )
             self.documentObject.variableFonts.append(variableFont)

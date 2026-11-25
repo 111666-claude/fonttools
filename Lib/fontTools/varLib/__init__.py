@@ -29,6 +29,7 @@ from fontTools.misc.roundTools import noRound, otRound
 from fontTools.misc.fixedTools import floatToFixed as fl2fi
 from fontTools.misc.textTools import Tag, tostr
 from fontTools.ttLib import TTFont, newTable
+from fontTools.ttLib.tables import _n_a_m_e
 from fontTools.ttLib.tables._f_v_a_r import Axis, NamedInstance
 from fontTools.ttLib.tables._g_l_y_f import (
     GlyphCoordinates,
@@ -55,7 +56,7 @@ import os.path
 import logging
 from copy import deepcopy
 from pprint import pformat
-from re import fullmatch
+from re import fullmatch, sub
 from .errors import VarLibError, VarLibValidationError
 
 log = logging.getLogger("fontTools.varLib")
@@ -1213,6 +1214,219 @@ def drop_implied_oncurve_points(*masters: TTFont) -> int:
     return count
 
 
+def _apply_variable_font_family_name(vf, variableFont):
+    """Overwrite the family name records of a built variable font with the
+    explicit family name given on its ``<variable-font>`` descriptor, if any.
+
+    The descriptor's family names (English :attr:`familyName` plus any
+    :attr:`localisedFamilyName` translations) are written to name IDs 1
+    (Family Name) and 16 (Typographic Family Name). The corresponding Full
+    Font Name (4) and PostScript Name (6) are rebuilt per language, keeping
+    the style name inherited from the default source (IDs 2 and 17 are never
+    touched). Existing records of a language that the descriptor does not
+    translate are left as inherited.
+    """
+    familyNames = dict(variableFont.localisedFamilyName)
+    if variableFont.familyName is not None:
+        familyNames.setdefault("en", variableFont.familyName)
+    if not familyNames:
+        return
+
+    from fontTools.varLib.instancer.names import NameID
+
+    nameTable = vf["name"]
+
+    # Which platforms does this font already use for its family records?
+    # We only rewrite platforms that exist, so a font without Mac names does
+    # not suddenly grow any, and unrelated platform records stay untouched.
+    platforms = {
+        (record.platformID, record.platEncID, record.langID)
+        for record in nameTable.names
+        if record.nameID == NameID.FAMILY_NAME
+    }
+    if not platforms:
+        log.warning(
+            "Cannot apply variable-font family name %r: the font has no "
+            "name ID 1 records",
+            familyNames,
+        )
+        return
+
+    # Style names are not part of the descriptor: they stay inherited from
+    # the default source. Languages whose own records lack a style name fall
+    # back to the English style, matching the fallback of the localised name
+    # lookup below.
+    englishStyle = (
+        nameTable.getName(NameID.TYPOGRAPHIC_SUBFAMILY_NAME, 3, 1, 0x409)
+        or nameTable.getName(NameID.SUBFAMILY_NAME, 3, 1, 0x409)
+        or nameTable.getName(NameID.TYPOGRAPHIC_SUBFAMILY_NAME, 1, 0, 0)
+        or nameTable.getName(NameID.SUBFAMILY_NAME, 1, 0, 0)
+    )
+    if englishStyle is None:
+        log.warning(
+            "Cannot apply family name %r: the font has no name ID 2 or 17",
+            variableFont.familyName,
+        )
+        return
+    englishStyle = englishStyle.toUnicode()
+
+    def styleNameFor(platform):
+        styleRecord = nameTable.getName(
+            NameID.TYPOGRAPHIC_SUBFAMILY_NAME, *platform
+        ) or nameTable.getName(NameID.SUBFAMILY_NAME, *platform)
+        return styleRecord.toUnicode() if styleRecord is not None else englishStyle
+
+    # Map each existing platform record to a BCP 47 language tag, then decide
+    # whether the descriptor provides a replacement for that language.
+    replacements = []  # (platform triple, new family name)
+    for platform in sorted(platforms):
+        langTag = _bcp47LanguageTag(vf, *platform)
+        newFamilyName = _localisedNameForLanguage(familyNames, langTag)
+        if newFamilyName is not None:
+            replacements.append((platform, newFamilyName))
+
+    for platform, newFamilyName in replacements:
+        platformID, platEncID, langID = platform
+        styleName = styleNameFor(platform)
+
+        # Family name: rewrite ID 1 in place (record always exists) and make
+        # sure ID 16 carries the same typographic family name.
+        familyRecord = nameTable.getName(NameID.FAMILY_NAME, *platform)
+        familyRecord.string = newFamilyName
+        nameTable.setName(
+            newFamilyName,
+            NameID.TYPOGRAPHIC_FAMILY_NAME,
+            platformID,
+            platEncID,
+            langID,
+        )
+
+        # Full font name: family + style, dropping an elidable "Regular".
+        fullName = (
+            newFamilyName
+            if styleName.lower() == "regular"
+            else f"{newFamilyName} {styleName}"
+        )
+        nameTable.setName(
+            fullName, NameID.FULL_FONT_NAME, platformID, platEncID, langID
+        )
+
+        # PostScript name: only rebuild where the font already defines one,
+        # so we don't invent records the default source did not have.
+        if nameTable.getName(NameID.POSTSCRIPT_NAME, *platform) is not None:
+            psName = _buildPostScriptName(newFamilyName, styleName)
+            nameTable.setName(
+                psName, NameID.POSTSCRIPT_NAME, platformID, platEncID, langID
+            )
+
+    # Add localised family records for descriptor languages that the font did
+    # not have at all (e.g. a French translation added on the VF descriptor),
+    # for both family name IDs and the derived full-name / PostScript records.
+    coveredTags = {_bcp47LanguageTag(vf, *platform) for platform in platforms}
+    macNames = any(platformID == 1 for platformID, _, _ in platforms)
+    hasPSName = any(
+        record.nameID == NameID.POSTSCRIPT_NAME for record in nameTable.names
+    )
+    for langTag, localisedFamilyName in familyNames.items():
+        if langTag in coveredTags or langTag == "en":
+            continue
+
+        def addLocalisedRecord(value, nameID):
+            # addMultilingualName does not dedupe when a nameID is given, so
+            # skip platforms that already carry this nameID/language to avoid
+            # emitting duplicate name records.
+            if langTag.lower() in _n_a_m_e._WINDOWS_LANGUAGE_CODES:
+                windowsName = _n_a_m_e._makeWindowsName(value, nameID, langTag)
+                if windowsName is not None and not nameTable.getName(
+                    nameID,
+                    windowsName.platformID,
+                    windowsName.platEncID,
+                    windowsName.langID,
+                ):
+                    nameTable.names.append(windowsName)
+            if macNames:
+                macName = _n_a_m_e._makeMacName(value, nameID, langTag, vf)
+                if macName is not None and not nameTable.getName(
+                    nameID,
+                    macName.platformID,
+                    macName.platEncID,
+                    macName.langID,
+                ):
+                    nameTable.names.append(macName)
+
+        for nameID in (NameID.FAMILY_NAME, NameID.TYPOGRAPHIC_FAMILY_NAME):
+            addLocalisedRecord(localisedFamilyName, nameID)
+        fullName = (
+            localisedFamilyName
+            if englishStyle.lower() == "regular"
+            else f"{localisedFamilyName} {englishStyle}"
+        )
+        addLocalisedRecord(fullName, NameID.FULL_FONT_NAME)
+        if hasPSName:
+            addLocalisedRecord(
+                _buildPostScriptName(localisedFamilyName, englishStyle),
+                NameID.POSTSCRIPT_NAME,
+            )
+
+
+def _bcp47LanguageTag(font, platformID, platEncID, langID):
+    """Best-effort conversion of a name record's platform language to a
+    BCP 47 language tag used as a key in the designspace localised names."""
+    if platformID == 3:
+        # Windows records encode an LCID; invert the BCP47 -> LCID mapping.
+        return _WINDOWS_LANG_TO_BCP47.get(langID)
+    elif platformID == 1:
+        return _MAC_LANG_TO_BCP47.get(langID)
+    elif platformID == 0 and "ltag" in font:
+        # Unicode platform records store an index into the 'ltag' table.
+        tags = font["ltag"].table.tags
+        if langID < len(tags):
+            return tags[langID]
+    return None
+
+
+def _invertLanguageCodeMapping(mapping):
+    return {code: lang for lang, code in mapping.items()}
+
+
+_WINDOWS_LANG_TO_BCP47 = _invertLanguageCodeMapping(_n_a_m_e._WINDOWS_LANGUAGE_CODES)
+_MAC_LANG_TO_BCP47 = _invertLanguageCodeMapping(_n_a_m_e._MAC_LANGUAGE_CODES)
+
+
+def _localisedNameForLanguage(localisedNames, langTag):
+    """Look up ``langTag`` in the localised-names dict, matching either the
+    full tag or its language subtag (e.g. both "de-CH" and "de-DE" match a
+    "de" entry, and a "de-DE" entry matches a "de" record), falling back to
+    English when nothing matches."""
+    if not langTag:
+        return localisedNames.get("en")
+    primary = langTag.split("-")[0]
+    if langTag in localisedNames:
+        return localisedNames[langTag]
+    if primary in localisedNames:
+        return localisedNames[primary]
+    # Symmetric case: the descriptor uses a more specific tag than the
+    # font record (e.g. descriptor "de-DE" vs. record language "de").
+    for tag, value in localisedNames.items():
+        if tag.split("-")[0] == primary:
+            return value
+    if langTag != "en":
+        return localisedNames.get("en")
+    return None
+
+
+def _buildPostScriptName(familyName, styleName):
+    """Build a PostScript name (name ID 6) from a family and a style,
+    following the allowed-character restrictions of Adobe Tech Note #5902."""
+    psName = f"{familyName.replace(' ', '')}-{styleName.replace(' ', '')}"
+    # Remove any characters other than uppercase Latin letters, lowercase
+    # Latin letters, digits and hyphens.
+    psName = sub(r"[^A-Za-z0-9-]", r"", psName)
+    if len(psName) > 127:
+        psName = f"{psName[:124]}..."
+    return psName
+
+
 def build_many(
     designspace: DesignSpaceDocument,
     master_finder=lambda s: s,
@@ -1237,6 +1451,12 @@ def build_many(
     Always returns a Dict[str, TTFont] keyed by VariableFontDescriptor.name
     """
     res = {}
+    # Map each variable-font name back to its descriptor, so the explicit
+    # family name declared in the designspace can be applied after building.
+    vfDescriptors = {
+        variableFont.name: variableFont
+        for variableFont in designspace.getVariableFonts()
+    }
     # varLib.build (used further below) by default only builds an incomplete 'STAT'
     # with an empty AxisValueArray--unless the VF inherited 'STAT' from its base master.
     # Designspace version 5 can also be used to define 'STAT' labels or customize
@@ -1268,6 +1488,7 @@ def build_many(
             )[0]
             if doBuildStatFromDSv5:
                 buildVFStatTable(vf, designspace, name)
+            _apply_variable_font_family_name(vf, vfDescriptors[name])
             res[name] = vf
     return res
 
