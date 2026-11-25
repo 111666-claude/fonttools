@@ -1392,7 +1392,6 @@ def _instantiateBASE(varfont, axisLimits):
 
 
 def instantiateOTL(varfont, axisLimits):
-    # TODO(anthrotype) Support partial instancing of JSTF table
     _instantiateBASE(varfont, axisLimits)
 
     if (
@@ -1402,11 +1401,10 @@ def instantiateOTL(varfont, axisLimits):
     ):
         return
 
-    if "GPOS" in varfont:
-        msg = "Instantiating GDEF and GPOS tables"
-    else:
-        msg = "Instantiating GDEF table"
-    log.info(msg)
+    # MATH and JSTF can reference the shared ItemVariationStore kept in GDEF,
+    # through MathValueRecords and positioning lookups respectively.
+    tags = [tag for tag in ("GDEF", "GPOS", "MATH", "JSTF") if tag in varfont]
+    log.info("Instantiating %s tables", " and ".join(tags))
 
     gdef = varfont["GDEF"].table
     varStore = gdef.VarStore
@@ -1420,19 +1418,24 @@ def instantiateOTL(varfont, axisLimits):
     # they will be split again upon compilation).
     # This 'merger' also works as a 'visitor' that traverses the OTL tables and
     # calls specific methods when instances of a given type are found.
-    # Specifically, it adds default deltas to GPOS Anchors/ValueRecords and GDEF
-    # LigatureCarets, and optionally deletes all VariationIndex tables if the
-    # VarStore is fully instanced.
+    # Specifically, it adds default deltas to GPOS Anchors/ValueRecords, GDEF
+    # LigatureCarets and MATH MathValueRecords, and optionally deletes the
+    # VariationIndex tables if the VarStore is fully instanced. Ordinary
+    # ppem-based Device tables are left untouched.
     merger = MutatorMerger(
         varfont, defaultDeltas, deleteVariations=(not varStore.VarRegionList.Region)
     )
-    merger.mergeTables(varfont, [varfont], ["GDEF", "GPOS"])
+    merger.mergeTables(varfont, [varfont], ["GDEF", "GPOS", "MATH", "JSTF"])
 
     if varStore.VarRegionList.Region:
         varIndexMapping = varStore.optimize()
-        gdef.remap_device_varidxes(varIndexMapping)
-        if "GPOS" in varfont:
-            varfont["GPOS"].table.remap_device_varidxes(varIndexMapping)
+        # Share the visited set across tables so that Devices shared between
+        # them are only remapped once.
+        done = set()
+        gdef.remap_device_varidxes(varIndexMapping, done=done)
+        for tag in ("GPOS", "MATH", "JSTF"):
+            if tag in varfont:
+                varfont[tag].table.remap_device_varidxes(varIndexMapping, done=done)
     else:
         # Downgrade GDEF.
         del gdef.VarStore

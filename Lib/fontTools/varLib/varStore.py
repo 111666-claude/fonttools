@@ -400,6 +400,8 @@ def Object_collect_device_varidxes(self, varidxes):
 
 ot.GDEF.collect_device_varidxes = Object_collect_device_varidxes
 ot.GPOS.collect_device_varidxes = Object_collect_device_varidxes
+ot.MATH.collect_device_varidxes = Object_collect_device_varidxes
+ot.JSTF.collect_device_varidxes = Object_collect_device_varidxes
 
 
 def _Device_mapVarIdx(self, mapping, done):
@@ -408,19 +410,27 @@ def _Device_mapVarIdx(self, mapping, done):
         return
     done.add(id(self))
     if self.DeltaFormat == 0x8000:
-        varIdx = mapping[(self.StartSize << 16) + self.EndSize]
+        # Devices pointing at delta sets that are not in the map (e.g. because
+        # they were out of range to begin with) degrade to NO_VARIATION_INDEX.
+        varIdx = mapping.get((self.StartSize << 16) + self.EndSize, NO_VARIATION_INDEX)
         self.StartSize = varIdx >> 16
         self.EndSize = varIdx & 0xFFFF
 
 
-def Object_remap_device_varidxes(self, varidxes_map):
-    mapper = partial(_Device_mapVarIdx, mapping=varidxes_map, done=set())
+def Object_remap_device_varidxes(self, varidxes_map, *, done=None):
+    # Share the 'done' set between tables so that a Device object referenced
+    # from more than one table is only remapped once.
+    if done is None:
+        done = set()
+    mapper = partial(_Device_mapVarIdx, mapping=varidxes_map, done=done)
     _visit(self, mapper)
 
 
 ot.GDEF.remap_device_varidxes = Object_remap_device_varidxes
 ot.GPOS.remap_device_varidxes = Object_remap_device_varidxes
 ot.BASE.remap_device_varidxes = Object_remap_device_varidxes
+ot.MATH.remap_device_varidxes = Object_remap_device_varidxes
+ot.JSTF.remap_device_varidxes = Object_remap_device_varidxes
 
 
 class _Encoding(object):
@@ -910,9 +920,11 @@ def main(args=None):
     print("After:  %7d bytes" % size)
 
     if outfile is not None:
-        gdef.table.remap_device_varidxes(varidx_map)
-        if "GPOS" in font:
-            font["GPOS"].table.remap_device_varidxes(varidx_map)
+        done = set()
+        gdef.table.remap_device_varidxes(varidx_map, done=done)
+        for tag in ("GPOS", "MATH", "JSTF"):
+            if tag in font:
+                font[tag].table.remap_device_varidxes(varidx_map, done=done)
 
         font.save(outfile)
 

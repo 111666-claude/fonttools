@@ -2306,16 +2306,26 @@ def _pruneGDEF(font):
 
     # Collect.
     table.collect_device_varidxes(usedVarIdxes)
-    if "GPOS" in font:
-        font["GPOS"].table.collect_device_varidxes(usedVarIdxes)
+    for tag in ("GPOS", "MATH", "JSTF"):
+        if tag in font:
+            font[tag].table.collect_device_varidxes(usedVarIdxes)
 
     # Subset.
+    # Missing delta sets contribute zero, just like NO_VARIATION_INDEX does.
+    usedVarIdxes = {
+        index
+        for index in usedVarIdxes
+        if index >> 16 < len(store.VarData)
+        and index & 0xFFFF < len(store.VarData[index >> 16].Item)
+    }
     varidx_map = store.subset_varidxes(usedVarIdxes)
 
     # Map.
-    table.remap_device_varidxes(varidx_map)
-    if "GPOS" in font:
-        font["GPOS"].table.remap_device_varidxes(varidx_map)
+    done = set()
+    table.remap_device_varidxes(varidx_map, done=done)
+    for tag in ("GPOS", "MATH", "JSTF"):
+        if tag in font:
+            font[tag].table.remap_device_varidxes(varidx_map, done=done)
 
 
 @_add_method(ttLib.getTableClass("GDEF"))

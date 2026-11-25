@@ -1137,16 +1137,34 @@ def merge(merger, self, lst):
 
     instancer = merger.instancer
     dev = self.DeviceTable
+    if dev is not None and dev.DeltaFormat != 0x8000:
+        # An ordinary ppem-based device correction, not a VariationIndex.
+        return
     if merger.deleteVariations:
         del self.DeviceTable
     if dev:
-        assert dev.DeltaFormat == 0x8000
         varidx = (dev.StartSize << 16) + dev.EndSize
         delta = otRound(instancer[varidx])
         self.Coordinate += delta
 
     if merger.deleteVariations:
         self.Format = 1
+
+
+@MutatorMerger.merger(ot.MathValueRecord)
+def merge(merger, self, lst):
+    # Hack till we become selfless.
+    self.__dict__ = lst[0].__dict__.copy()
+
+    dev = getattr(self, "DeviceTable", None)
+    if dev is None or dev.DeltaFormat != 0x8000:
+        # No variation here: leave ordinary ppem device corrections untouched.
+        return
+
+    varidx = (dev.StartSize << 16) + dev.EndSize
+    self.Value += otRound(merger.instancer[varidx])
+    if merger.deleteVariations:
+        self.DeviceTable = None
 
 
 @MutatorMerger.merger(ot.Anchor)
@@ -1163,19 +1181,23 @@ def merge(merger, self, lst):
         if not hasattr(self, tableName):
             continue
         dev = getattr(self, tableName)
+        if dev is not None and dev.DeltaFormat != 0x8000:
+            # An ordinary ppem-based device correction, not a VariationIndex.
+            continue
         if merger.deleteVariations:
             delattr(self, tableName)
         if dev is None:
             continue
-
-        assert dev.DeltaFormat == 0x8000
         varidx = (dev.StartSize << 16) + dev.EndSize
         delta = otRound(instancer[varidx])
 
         attr = v + "Coordinate"
         setattr(self, attr, getattr(self, attr) + delta)
 
-    if merger.deleteVariations:
+    if merger.deleteVariations and not any(
+        getattr(self, axis + "DeviceTable", None) for axis in "XY"
+    ):
+        # Keep format 3 if an ordinary ppem device remains on either axis.
         self.Format = 1
 
 
@@ -1194,12 +1216,13 @@ def merge(merger, self, lst):
         if not hasattr(self, tableName):
             continue
         dev = getattr(self, tableName)
+        if dev is not None and dev.DeltaFormat != 0x8000:
+            # An ordinary ppem-based device correction, not a VariationIndex.
+            continue
         if merger.deleteVariations:
             delattr(self, tableName)
         if dev is None:
             continue
-
-        assert dev.DeltaFormat == 0x8000
         varidx = (dev.StartSize << 16) + dev.EndSize
         delta = otRound(instancer[varidx])
 
