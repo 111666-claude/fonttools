@@ -996,6 +996,289 @@ class FontBuilder(object):
             macNames=any(nr.platformID == 1 for nr in self.font["name"].names),
         )
 
+    def setupLigatureSubst(
+        self,
+        ligatures,
+        featureTag="liga",
+        scriptTag="DFLT",
+        langSysTag="dflt",
+    ):
+        """Build a GSUB ligature substitution (LookupType 4) lookup and attach
+        it to the given feature.
+
+        The `ligatures` argument is a mapping from tuples of glyph names (the
+        input sequences) to the name of the resulting ligature glyph, for
+        example::
+
+            fb.setupLigatureSubst({
+                ("f", "i"): "f_i",
+                ("f", "l"): "f_l",
+                ("f", "f", "i"): "f_f_i",
+            })
+
+        A new GSUB table is created if the font does not have one yet. Any
+        existing GSUB table, including its script and language system
+        associations, features and other lookups, is left in place: the new
+        lookup is appended to the LookupList and its index is added to the
+        given feature, which is itself attached to the given script and
+        language system. The feature and script/language system are created if
+        they do not exist yet.
+
+        Rules sharing a common first glyph (e.g. ``("f", "i")`` and
+        ``("f", "l")``) end up in the same LigatureSet, with longer sequences
+        ordered first, as required by the OpenType specification. Duplicate
+        rules are tolerated as long as they map to the same ligature glyph;
+        two identical sequences mapping to different glyphs raise a
+        ``ValueError``. Every referenced glyph must exist in the font and each
+        input sequence must contain at least two glyphs, otherwise a
+        ``ValueError`` is raised. All input is validated before the font is
+        modified, so an error never leaves a partially built table.
+
+        Args:
+            ligatures: A mapping from tuples of glyph names to ligature glyph
+                names.
+            featureTag: The 4-byte tag of the feature to attach the lookup to
+                (defaults to ``"liga"``).
+            scriptTag: The 4-byte script tag under which the feature is made
+                available (defaults to ``"DFLT"``).
+            langSysTag: The 4-byte language system tag; ``"dflt"`` denotes the
+                default language system of the script (defaults to
+                ``"dflt"``).
+        """
+        from .ttLib.tables import otTables as ot
+
+        _validateLayoutTag(featureTag, "featureTag")
+        _validateLayoutTag(scriptTag, "scriptTag")
+        _validateLayoutTag(langSysTag, "langSysTag")
+
+        glyphMap = self.font.getReverseGlyphMap()
+        rules = _validateLigatureRules(ligatures, glyphMap)
+
+        # From here on nothing can fail: build the objects first and only then
+        # touch the font, so an invalid input never leaves a half-built table.
+        from .otlLib.builder import buildLigatureSubstSubtable, buildLookup
+
+        lookup = buildLookup([buildLigatureSubstSubtable(rules)], table="GSUB")
+
+        if "GSUB" not in self.font:
+            self.font["GSUB"] = _buildGSUBTable()
+        gsub = self.font["GSUB"].table
+
+        lookupList = ot._getLookupList(gsub)
+        featureList = ot._getLayoutList(gsub, "FeatureList")
+        scriptList = ot._getLayoutList(gsub, "ScriptList")
+
+        lookupIndex = len(lookupList.Lookup)
+        lookupList.Lookup.append(lookup)
+        lookupList.LookupCount = len(lookupList.Lookup)
+
+        featureRecord = _findFeatureRecord(featureList, featureTag)
+        if featureRecord is None:
+            featureRecord = _buildFeatureRecord(featureTag, [])
+            featureList.FeatureRecord.append(featureRecord)
+            featureList.FeatureCount = len(featureList.FeatureRecord)
+            # Re-sorting changes feature indices referenced by the ScriptList
+            # (and by FeatureVariations, if any); sortFeatureList remaps them.
+            from .varLib.featureVars import sortFeatureList
+
+            sortFeatureList(gsub)
+        featureIndex = featureList.FeatureRecord.index(featureRecord)
+
+        if lookupIndex not in featureRecord.Feature.LookupListIndex:
+            featureRecord.Feature.LookupListIndex.append(lookupIndex)
+            featureRecord.Feature.LookupCount = len(
+                featureRecord.Feature.LookupListIndex
+            )
+
+        _attachFeatureToScript(scriptList, scriptTag, langSysTag, featureIndex)
+
+        if "OS/2" in self.font:
+            from .otlLib.maxContextCalc import maxCtxFont
+
+            self.font["OS/2"].usMaxContext = maxCtxFont(self.font)
+
+
+def _validateLayoutTag(tag, argumentName):
+    if not isinstance(tag, str) or len(tag.encode("ascii", "strict")) != 4:
+        raise ValueError(f"{argumentName} must be a 4-byte ASCII tag, got {tag!r}")
+
+
+def _validateLigatureRules(ligatures, glyphMap):
+    """Validate a ligature mapping and return a deterministically ordered dict.
+
+    Raises ValueError on missing glyphs, sequences shorter than two glyphs,
+    non-string glyph names or identical sequences mapping to different ligature
+    glyphs. Exact duplicate rules are collapsed.
+    """
+    if not ligatures:
+        raise ValueError("ligatures mapping must not be empty")
+
+    normalized = {}
+    missingGlyphs = set()
+    errors = []
+    for components, ligGlyph in ligatures.items():
+        if not isinstance(components, tuple) or not all(
+            isinstance(glyphName, str) for glyphName in components
+        ):
+            errors.append(
+                f"ligature input sequence must be a tuple of glyph name "
+                f"strings, got {components!r}"
+            )
+            continue
+        if len(components) < 2:
+            errors.append(
+                f"ligature input sequence must contain at least two glyphs, "
+                f"got {components!r}"
+            )
+            continue
+        if not isinstance(ligGlyph, str):
+            errors.append(
+                f"ligature output glyph name must be a string, got {ligGlyph!r} "
+                f"for sequence {components!r}"
+            )
+            continue
+
+        previous = normalized.get(components)
+        if previous is not None and previous != ligGlyph:
+            errors.append(
+                f"conflicting ligature rules for sequence {components!r}: "
+                f"{previous!r} vs {ligGlyph!r}"
+            )
+            continue
+        normalized[components] = ligGlyph
+
+        for glyphName in (*components, ligGlyph):
+            if glyphName not in glyphMap:
+                missingGlyphs.add(glyphName)
+
+    if missingGlyphs:
+        errors.append(
+            "ligature rules reference glyphs missing from the font: "
+            + ", ".join(sorted(missingGlyphs))
+        )
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    # Longest sequences first; ties keep a stable, content-based order so the
+    # output does not depend on the caller's dict iteration order.
+    return OrderedDict(
+        (components, normalized[components])
+        for components in sorted(normalized, key=lambda c: (-len(c), c))
+    )
+
+
+def _buildGSUBTable():
+    from .ttLib import newTable
+    from .ttLib.tables import otTables as ot
+
+    fontTable = newTable("GSUB")
+    gsub = fontTable.table = ot.GSUB()
+    gsub.Version = 0x00010000
+
+    gsub.ScriptList = ot.ScriptList()
+    gsub.ScriptList.ScriptRecord = []
+    gsub.ScriptList.ScriptCount = 0
+    gsub.FeatureList = ot.FeatureList()
+    gsub.FeatureList.FeatureRecord = []
+    gsub.FeatureList.FeatureCount = 0
+    gsub.LookupList = ot.LookupList()
+    gsub.LookupList.Lookup = []
+    gsub.LookupList.LookupCount = 0
+    return fontTable
+
+
+def _buildFeatureRecord(featureTag, lookupListIndices):
+    from .ttLib.tables import otTables as ot
+
+    record = ot.FeatureRecord()
+    record.FeatureTag = featureTag
+    record.Feature = ot.Feature()
+    record.Feature.FeatureParams = None
+    record.Feature.LookupListIndex = list(lookupListIndices)
+    record.Feature.LookupCount = len(lookupListIndices)
+    return record
+
+
+def _findFeatureRecord(featureList, featureTag):
+    for record in featureList.FeatureRecord:
+        if record.FeatureTag == featureTag:
+            return record
+    return None
+
+
+def _buildLangSys(featureIndices):
+    from .ttLib.tables import otTables as ot
+
+    langSys = ot.LangSys()
+    langSys.LookupOrder = None
+    langSys.ReqFeatureIndex = 0xFFFF
+    langSys.FeatureIndex = list(featureIndices)
+    langSys.FeatureCount = len(featureIndices)
+    return langSys
+
+
+def _findScriptRecord(scriptList, scriptTag):
+    for record in scriptList.ScriptRecord:
+        if record.ScriptTag == scriptTag:
+            return record
+    return None
+
+
+def _addFeatureIndex(langSys, featureIndex):
+    if featureIndex not in langSys.FeatureIndex:
+        langSys.FeatureIndex.append(featureIndex)
+        langSys.FeatureIndex.sort()
+        langSys.FeatureCount = len(langSys.FeatureIndex)
+
+
+def _attachFeatureToScript(scriptList, scriptTag, langSysTag, featureIndex):
+    """Make sure the feature index is reachable from the given script and
+    language system, creating the script record, default language system or
+    language system record as needed.
+
+    When attaching to the default language system (``langSysTag == "dflt"``),
+    the feature is also added to every explicit language system of the script
+    that does not already list it: the default language system applies to all
+    of the script's languages, so a feature available there must remain
+    reachable through each existing language system too.
+    """
+    from .ttLib.tables import otTables as ot
+
+    scriptRecord = _findScriptRecord(scriptList, scriptTag)
+    if scriptRecord is None:
+        scriptRecord = ot.ScriptRecord()
+        scriptRecord.ScriptTag = scriptTag
+        scriptRecord.Script = ot.Script()
+        scriptRecord.Script.DefaultLangSys = None
+        scriptRecord.Script.LangSysRecord = []
+        scriptRecord.Script.LangSysCount = 0
+        scriptList.ScriptRecord.append(scriptRecord)
+        scriptList.ScriptRecord.sort(key=lambda record: record.ScriptTag)
+        scriptList.ScriptCount = len(scriptList.ScriptRecord)
+    script = scriptRecord.Script
+
+    if langSysTag == "dflt":
+        if script.DefaultLangSys is None:
+            script.DefaultLangSys = _buildLangSys([])
+        _addFeatureIndex(script.DefaultLangSys, featureIndex)
+        for record in script.LangSysRecord:
+            _addFeatureIndex(record.LangSys, featureIndex)
+        return
+
+    langSysRecord = None
+    for record in script.LangSysRecord:
+        if record.LangSysTag == langSysTag:
+            langSysRecord = record
+            break
+    if langSysRecord is None:
+        langSysRecord = ot.LangSysRecord()
+        langSysRecord.LangSysTag = langSysTag
+        langSysRecord.LangSys = _buildLangSys([])
+        script.LangSysRecord.append(langSysRecord)
+        script.LangSysRecord.sort(key=lambda record: record.LangSysTag)
+        script.LangSysCount = len(script.LangSysRecord)
+    _addFeatureIndex(langSysRecord.LangSys, featureIndex)
+
 
 def buildCmapSubTable(cmapping, format, platformID, platEncID):
     subTable = cmap_classes[format](format)

@@ -657,3 +657,272 @@ def test_setupPanose():
 
     for name, value in panoseValues.items():
         assert getattr(fb.font["OS/2"].panose, name) == value
+
+
+# ---------------------------------------------------------------------------
+# setupLigatureSubst
+# ---------------------------------------------------------------------------
+
+LIGATURE_GLYPHS = [".notdef", "space", "f", "i", "l", "t", "fi", "fl", "ffi", "ft"]
+
+
+def _setupLigatureFont(glyphs=None):
+    glyphs = glyphs if glyphs is not None else LIGATURE_GLYPHS
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(glyphs)
+    fb.setupCharacterMap({0x20: "space", 0x66: "f", 0x69: "i", 0x6C: "l", 0x74: "t"})
+    pen = TTGlyphPen(None)
+    glyph = pen.glyph()
+    fb.setupGlyf({name: glyph for name in glyphs})
+    fb.setupHorizontalMetrics({name: (500, 0) for name in glyphs})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": "LigaTest", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    return fb
+
+
+def _ligatureSubst(font):
+    lookup = font["GSUB"].table.LookupList.Lookup[-1]
+    assert lookup.LookupType == 4
+    assert lookup.SubTableCount == 1
+    return lookup.SubTable[0]
+
+
+def test_setupLigatureSubst_basic():
+    fb = _setupLigatureFont()
+    fb.setupLigatureSubst({("f", "i"): "fi", ("f", "l"): "fl"})
+
+    gsub = fb.font["GSUB"].table
+    assert gsub.Version == 0x00010000
+    assert len(gsub.LookupList.Lookup) == 1
+    assert gsub.LookupList.Lookup[0].LookupType == 4
+
+    featureRecord = gsub.FeatureList.FeatureRecord[0]
+    assert featureRecord.FeatureTag == "liga"
+    assert featureRecord.Feature.LookupListIndex == [0]
+
+    scriptRecord = gsub.ScriptList.ScriptRecord[0]
+    assert scriptRecord.ScriptTag == "DFLT"
+    assert scriptRecord.Script.LangSysCount == 0
+    assert scriptRecord.Script.DefaultLangSys.FeatureIndex == [0]
+    assert scriptRecord.Script.DefaultLangSys.ReqFeatureIndex == 0xFFFF
+
+    ligatures = _ligatureSubst(fb.font).ligatures
+    assert set(ligatures) == {"f"}
+    assert [(lig.Component, lig.LigGlyph) for lig in ligatures["f"]] == [
+        (("i",), "fi"),
+        (("l",), "fl"),
+    ]
+    # the longest context the shaping engine may need to look at
+    assert fb.font["OS/2"].usMaxContext == 2
+
+
+def test_setupLigatureSubst_commonPrefixAndOrdering():
+    rules = {
+        ("f", "i"): "fi",
+        ("f", "l"): "fl",
+        ("f", "f", "i"): "ffi",
+        ("f", "t"): "ft",
+    }
+    # The resulting lookup must not depend on the input mapping order.
+    for permutation in (
+        rules,
+        dict(reversed(list(rules.items()))),
+        {("f", "t"): "ft", ("f", "f", "i"): "ffi", ("f", "l"): "fl", ("f", "i"): "fi"},
+    ):
+        fb = _setupLigatureFont()
+        fb.setupLigatureSubst(permutation)
+        ligatures = _ligatureSubst(fb.font).ligatures
+        assert list(ligatures) == ["f"]
+        # the three-glyph rule must come before the two-glyph rules, and
+        # equal-length rules keep a deterministic content-based order
+        assert [(lig.Component, lig.LigGlyph) for lig in ligatures["f"]] == [
+            (("f", "i"), "ffi"),
+            (("i",), "fi"),
+            (("l",), "fl"),
+            (("t",), "ft"),
+        ]
+    assert fb.font["OS/2"].usMaxContext == 3
+
+
+def test_setupLigatureSubst_matchesFeatureFileCompile():
+    from fontTools.misc.testTools import getXML
+
+    rules = {("f", "i"): "fi", ("f", "l"): "fl", ("f", "f", "i"): "ffi"}
+
+    builderFont = _setupLigatureFont()
+    builderFont.setupLigatureSubst(dict(reversed(list(rules.items()))))
+
+    feaFont = _setupLigatureFont()
+    feaFont.addOpenTypeFeatures("""
+        languagesystem DFLT dflt;
+        feature liga {
+          sub f i by fi;
+          sub f l by fl;
+          sub f f i by ffi;
+        } liga;
+        """)
+
+    assert getXML(builderFont.font["GSUB"].toXML, builderFont.font) == getXML(
+        feaFont.font["GSUB"].toXML, feaFont.font
+    )
+
+
+def test_setupLigatureSubst_roundTrip(tmp_path):
+    fb = _setupLigatureFont()
+    fb.setupLigatureSubst({("f", "i"): "fi", ("f", "l"): "fl", ("f", "f", "i"): "ffi"})
+    out = tmp_path / "liga.ttf"
+    fb.save(out)
+
+    reopened = TTFont(out)
+    assert len(reopened["GSUB"].table.LookupList.Lookup) == 1
+    ligatures = reopened["GSUB"].table.LookupList.Lookup[0].SubTable[0].ligatures
+    assert [lig.LigGlyph for lig in ligatures["f"]] == ["ffi", "fi", "fl"]
+
+
+def test_setupLigatureSubst_duplicates():
+    fb = _setupLigatureFont()
+    # exact duplicates are collapsed
+    fb.setupLigatureSubst({("f", "i"): "fi", ("f", "i"): "fi"})
+    ligatures = _ligatureSubst(fb.font).ligatures
+    assert len(ligatures["f"]) == 1
+
+    # conflicting duplicates within one call are rejected and leave no trace
+    conflictFont = _setupLigatureFont()
+
+    # a plain dict cannot retain duplicate keys, so emulate a mapping that does
+    class ConflictingMapping:
+        def __bool__(self):
+            return True
+
+        def items(self):
+            return [(("f", "i"), "fi"), (("f", "i"), "fl")]
+
+    with pytest.raises(ValueError, match="conflicting ligature rules"):
+        conflictFont.setupLigatureSubst(ConflictingMapping())
+    assert "GSUB" not in conflictFont.font
+    assert len(fb.font["GSUB"].table.LookupList.Lookup) == 1
+
+
+@pytest.mark.parametrize(
+    "rules, message",
+    [
+        ({("f",): "fi"}, "at least two glyphs"),
+        ({("fi",): "fi"}, "at least two glyphs"),
+        ({("f", "i"): "missing"}, "glyphs missing from the font"),
+        ({("f", "missing"): "fi"}, "glyphs missing from the font"),
+        ({("f", "i"): 5}, "output glyph name must be a string"),
+        ({("f", 1): "fi"}, "tuple of glyph name strings"),
+        ({}, "must not be empty"),
+    ],
+)
+def test_setupLigatureSubst_invalidInput(rules, message):
+    fb = _setupLigatureFont()
+    with pytest.raises(ValueError, match=message):
+        fb.setupLigatureSubst(rules)
+    # validation happens before the font is modified
+    assert "GSUB" not in fb.font
+
+
+def test_setupLigatureSubst_invalidTags():
+    fb = _setupLigatureFont()
+    rules = {("f", "i"): "fi"}
+    with pytest.raises(ValueError, match="featureTag"):
+        fb.setupLigatureSubst(rules, featureTag="x")
+    with pytest.raises(ValueError, match="scriptTag"):
+        fb.setupLigatureSubst(rules, scriptTag="latnX")
+    with pytest.raises(ValueError, match="langSysTag"):
+        fb.setupLigatureSubst(rules, langSysTag="en")
+    assert "GSUB" not in fb.font
+
+
+def test_setupLigatureSubst_coexistsWithExistingGSUB():
+    fb = _setupLigatureFont()
+    fb.addOpenTypeFeatures("""
+        languagesystem latn dflt;
+        languagesystem latn ENG;
+        feature rlig { sub f by t; } rlig;
+        """)
+    gsub = fb.font["GSUB"].table
+    assert [lookup.LookupType for lookup in gsub.LookupList.Lookup] == [1]
+
+    fb.setupLigatureSubst(
+        {("f", "i"): "fi", ("f", "l"): "fl"},
+        featureTag="liga",
+        scriptTag="latn",
+    )
+    gsub = fb.font["GSUB"].table
+
+    # the original lookup survives and the new one is appended
+    assert [lookup.LookupType for lookup in gsub.LookupList.Lookup] == [1, 4]
+    assert [record.FeatureTag for record in gsub.FeatureList.FeatureRecord] == [
+        "liga",
+        "rlig",
+    ]
+    rlig = next(
+        record
+        for record in gsub.FeatureList.FeatureRecord
+        if record.FeatureTag == "rlig"
+    )
+    assert rlig.Feature.LookupListIndex == [0]
+    liga = next(
+        record
+        for record in gsub.FeatureList.FeatureRecord
+        if record.FeatureTag == "liga"
+    )
+    assert liga.Feature.LookupListIndex == [1]
+
+    # both the default and the explicit language system reach both features
+    script = next(
+        record for record in gsub.ScriptList.ScriptRecord if record.ScriptTag == "latn"
+    )
+    assert script.Script.DefaultLangSys.FeatureIndex == [0, 1]
+    eng = next(
+        record for record in script.Script.LangSysRecord if record.LangSysTag == "ENG "
+    )
+    assert eng.LangSys.FeatureIndex == [0, 1]
+
+
+def test_setupLigatureSubst_reusesFeatureAndAddsScriptsAndLangSys():
+    fb = _setupLigatureFont()
+    fb.setupLigatureSubst({("f", "i"): "fi"}, featureTag="liga", scriptTag="latn")
+    # a second call with the same feature reuses it instead of duplicating it
+    fb.setupLigatureSubst({("f", "l"): "fl"}, featureTag="liga", scriptTag="latn")
+    gsub = fb.font["GSUB"].table
+    assert len(gsub.FeatureList.FeatureRecord) == 1
+    assert gsub.FeatureList.FeatureRecord[0].Feature.LookupListIndex == [0, 1]
+    assert len(gsub.LookupList.Lookup) == 2
+    assert gsub.ScriptList.ScriptRecord[0].Script.DefaultLangSys.FeatureIndex == [0]
+
+    # another script gets wired to the same feature record
+    fb.setupLigatureSubst({("f", "i"): "fi"}, featureTag="liga", scriptTag="cyrl")
+    gsub = fb.font["GSUB"].table
+    assert [record.ScriptTag for record in gsub.ScriptList.ScriptRecord] == [
+        "cyrl",
+        "latn",
+    ]
+    cyrl = next(
+        record for record in gsub.ScriptList.ScriptRecord if record.ScriptTag == "cyrl"
+    )
+    assert cyrl.Script.DefaultLangSys.FeatureIndex == [0]
+
+    # an explicit language system leaves the default language system alone
+    fb.setupLigatureSubst(
+        {("f", "i"): "fi"},
+        featureTag="clig",
+        scriptTag="grek",
+        langSysTag="ELL ",
+    )
+    gsub = fb.font["GSUB"].table
+    grek = next(
+        record for record in gsub.ScriptList.ScriptRecord if record.ScriptTag == "grek"
+    )
+    assert grek.Script.DefaultLangSys is None
+    assert grek.Script.LangSysRecord[0].LangSysTag == "ELL "
+    cligIndex = next(
+        index
+        for index, record in enumerate(gsub.FeatureList.FeatureRecord)
+        if record.FeatureTag == "clig"
+    )
+    assert grek.Script.LangSysRecord[0].LangSys.FeatureIndex == [cligIndex]
