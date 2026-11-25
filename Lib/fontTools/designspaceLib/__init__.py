@@ -452,6 +452,73 @@ AnisotropicLocationDict = Dict[str, Union[float, Tuple[float, float]]]
 SimpleLocationDict = Dict[str, float]
 
 
+# A normalized axis coordinate is an F2DOT14 value: the normalized range
+# [-1, +1] maps to the int16 range [-EPSILON_SCALE, +EPSILON_SCALE]. The
+# smallest representable step is therefore 1/EPSILON_SCALE normalized units.
+EPSILON_SCALE = 16384
+
+# The only epsilon offsets supported by the designspace mapping format.
+EPSILON_VALUES = (-1, 0, 1)
+
+
+def parseEpsilon(value, dimensionName=None):
+    """Validate an ``epsilon`` attribute and return one of ``-1``, ``0``, ``1``.
+
+    The attribute is an integer number of normalized int16 steps used to
+    nudge a mapping dimension's ``xvalue``. String values must be integer
+    tokens (``"1"``, not ``"1.0"``).
+
+    Raises :class:`DesignSpaceDocumentError` for any other value.
+    """
+    where = f' for dimension "{dimensionName}"' if dimensionName else ""
+    epsilon = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        epsilon = value
+    elif isinstance(value, float) and value.is_integer():
+        epsilon = int(value)
+    elif isinstance(value, str):
+        try:
+            epsilon = int(value.strip(), 10)
+        except ValueError:
+            epsilon = None
+    if epsilon not in EPSILON_VALUES:
+        raise DesignSpaceDocumentError(
+            f"Invalid epsilon value {value!r}{where}: expected one of -1, 0, 1."
+        )
+    return epsilon
+
+
+def _axisMinDefaultMax(axis):
+    if isinstance(axis, (tuple, list)):
+        minimum, default, maximum = axis
+    else:
+        minimum = axis.minimum
+        default = axis.default
+        maximum = axis.maximum
+    return float(minimum), float(default), float(maximum)
+
+
+def epsilonUserOffset(axis, epsilon):
+    """Return the signed user-space offset for ``epsilon`` normalized steps.
+
+    ``axis`` is an :class:`AxisDescriptor` (or any object exposing
+    ``minimum``/``default``/``maximum``), or a ``(minimum, default, maximum)``
+    triple.
+
+    A positive epsilon is scaled by the ``maximum - default`` span and a
+    negative epsilon by the ``default - minimum`` span, so asymmetric axes
+    yield the correct user-coordinate magnitude on either side of the
+    default. ``epsilon`` must be one of ``-1``, ``0`` or ``1``.
+    """
+    epsilon = parseEpsilon(epsilon)
+    minimum, default, maximum = _axisMinDefaultMax(axis)
+    if epsilon > 0:
+        return epsilon * (maximum - default) / EPSILON_SCALE
+    if epsilon < 0:
+        return epsilon * (default - minimum) / EPSILON_SCALE
+    return 0.0
+
+
 class AxisMappingDescriptor(SimpleDescriptor):
     """Represents the axis mapping element: mapping an input location
     to an output location in the designspace.
@@ -477,30 +544,55 @@ class AxisMappingDescriptor(SimpleDescriptor):
         </mappings>
     """
 
-    _attrs = ["inputLocation", "outputLocation"]
+    _attrs = [
+        "inputLocation",
+        "inputEpsilon",
+        "outputLocation",
+        "outputEpsilon",
+    ]
 
     def __init__(
         self,
         *,
         inputLocation=None,
         outputLocation=None,
+        inputEpsilon=None,
+        outputEpsilon=None,
         description=None,
         groupDescription=None,
     ):
         self.inputLocation: SimpleLocationDict = inputLocation or {}
         """dict. Axis values for the input of the mapping, in design space coordinates.
 
+        If an input dimension carries a nonzero ``epsilon``, its value is the
+        resolved coordinate with that normalized int16 nudge applied. The raw
+        ``xvalue`` base is retained separately for faithful XML round-tripping.
+
         varLib.
 
         .. versionadded:: 5.1
+        """
+        self.inputEpsilon: Dict[str, int] = inputEpsilon or {}
+        """dict. Optional ``{-1, 1}`` normalized-int16 nudges for input axes.
+
+        An axis is present only when its epsilon is nonzero. ``0`` and a
+        missing attribute both mean no nudge.
         """
         self.outputLocation: SimpleLocationDict = outputLocation or {}
         """dict. Axis values for the output of the mapping, in design space coordinates.
 
+        If an output dimension carries a nonzero ``epsilon``, its value is the
+        resolved coordinate with that normalized int16 nudge applied.
+
         varLib.
 
         .. versionadded:: 5.1
         """
+        self.outputEpsilon: Dict[str, int] = outputEpsilon or {}
+        """dict. Optional ``{-1, 1}`` normalized-int16 nudges for output axes."""
+        # Raw xvalue bases, used to write a clean lossless epsilon attribute.
+        self._inputBaseLocation: SimpleLocationDict = {}
+        self._outputBaseLocation: SimpleLocationDict = {}
         self.description = description
         """string. A description of the mapping.
 
@@ -1668,17 +1760,39 @@ class BaseDocWriter(object):
         mappingElement = ET.Element("mapping")
         if getattr(mappingObject, "description", None) is not None:
             mappingElement.attrib["description"] = mappingObject.description
-        for what in ("inputLocation", "outputLocation"):
+        for what, epsilonAttr, baseAttr in (
+            ("inputLocation", "inputEpsilon", "_inputBaseLocation"),
+            ("outputLocation", "outputEpsilon", "_outputBaseLocation"),
+        ):
             whatObject = getattr(mappingObject, what, None)
             if whatObject is None:
                 continue
+            epsilonObject = getattr(mappingObject, epsilonAttr, None) or {}
+            baseObject = getattr(mappingObject, baseAttr, None) or {}
             whatElement = ET.Element(what[:-8])
             mappingElement.append(whatElement)
 
             for name, value in whatObject.items():
                 dimensionElement = ET.Element("dimension")
                 dimensionElement.attrib["name"] = name
-                dimensionElement.attrib["xvalue"] = self.intOrFloat(value)
+                epsilon = epsilonObject.get(name)
+                if epsilon:
+                    baseValue = baseObject.get(name)
+                    if baseValue is None:
+                        # Programmatic descriptor: recover the raw xvalue from
+                        # the resolved location using the document axes.
+                        axis = self.documentObject.getAxis(name)
+                        if (
+                            axis is not None
+                            and getattr(axis, "minimum", None) is not None
+                        ):
+                            baseValue = value - epsilonUserOffset(axis, epsilon)
+                        else:
+                            baseValue = value
+                    dimensionElement.attrib["xvalue"] = self.intOrFloat(baseValue)
+                    dimensionElement.attrib["epsilon"] = str(int(epsilon))
+                else:
+                    dimensionElement.attrib["xvalue"] = self.intOrFloat(value)
                 whatElement.append(dimensionElement)
 
         mappingsElement.append(mappingElement)
@@ -2172,21 +2286,91 @@ class BaseDocReader(LogMixin):
                 outputElement = mappingElement.find("output")
                 inputLoc = {}
                 outputLoc = {}
-                for dimElement in inputElement.findall(".dimension"):
-                    name = dimElement.attrib["name"]
-                    value = float(dimElement.attrib["xvalue"])
+                inputEps = {}
+                outputEps = {}
+                inputBase = {}
+                outputBase = {}
+                inputDimensions = (
+                    inputElement.findall(".dimension")
+                    if inputElement is not None
+                    else []
+                )
+                outputDimensions = (
+                    outputElement.findall(".dimension")
+                    if outputElement is not None
+                    else []
+                )
+                for dimElement in inputDimensions:
+                    name, value, epsilon, baseValue = self._readMappingDimension(
+                        dimElement
+                    )
                     inputLoc[name] = value
-                for dimElement in outputElement.findall(".dimension"):
-                    name = dimElement.attrib["name"]
-                    value = float(dimElement.attrib["xvalue"])
+                    inputBase[name] = baseValue
+                    if epsilon:
+                        inputEps[name] = epsilon
+                for dimElement in outputDimensions:
+                    name, value, epsilon, baseValue = self._readMappingDimension(
+                        dimElement
+                    )
                     outputLoc[name] = value
+                    outputBase[name] = baseValue
+                    if epsilon:
+                        outputEps[name] = epsilon
                 axisMappingObject = self.axisMappingDescriptorClass(
                     inputLocation=inputLoc,
                     outputLocation=outputLoc,
+                    inputEpsilon=inputEps,
+                    outputEpsilon=outputEps,
                     description=description,
                     groupDescription=groupDescription,
                 )
+                axisMappingObject._inputBaseLocation = inputBase
+                axisMappingObject._outputBaseLocation = outputBase
                 self.documentObject.axisMappings.append(axisMappingObject)
+
+    def _readMappingDimension(self, dimElement):
+        """Parse one mapping ``<dimension>`` including its optional epsilon.
+
+        Returns ``(name, resolvedValue, epsilon, baseXValue)`` where
+        ``resolvedValue`` has the epsilon user-space offset applied and
+        ``epsilon`` is the validated integer (``0`` when absent or zero).
+        """
+        name = dimElement.attrib.get("name")
+        if not name:
+            raise DesignSpaceDocumentError(
+                "A mapping dimension requires a name attribute."
+            )
+        if "xvalue" not in dimElement.attrib:
+            raise DesignSpaceDocumentError(
+                f'Mapping dimension "{name}" requires an xvalue attribute.'
+            )
+        try:
+            baseValue = float(dimElement.attrib["xvalue"])
+        except ValueError:
+            raise DesignSpaceDocumentError(
+                f'Mapping dimension "{name}" has an invalid xvalue '
+                f'{dimElement.attrib["xvalue"]!r}.'
+            )
+
+        epsilonText = dimElement.attrib.get("epsilon")
+        if epsilonText is None:
+            return name, baseValue, 0, baseValue
+
+        epsilon = parseEpsilon(epsilonText, name)
+        if epsilon == 0:
+            return name, baseValue, 0, baseValue
+
+        axis = self.documentObject.getAxis(name)
+        if axis is None or any(
+            getattr(axis, attr, None) is None
+            for attr in ("minimum", "default", "maximum")
+        ):
+            raise DesignSpaceDocumentError(
+                f'Mapping dimension "{name}" uses epsilon="{epsilonText}", but '
+                "no continuous axis with that name (and min/default/max) exists."
+            )
+        value = baseValue + epsilonUserOffset(axis, epsilon)
+        return name, value, epsilon, baseValue
 
     def readAxisLabel(self, element: ET.Element):
         xml_attrs = {

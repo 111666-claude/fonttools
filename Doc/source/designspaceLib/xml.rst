@@ -293,7 +293,19 @@ Example of all axis elements together
 -  Child element of ``<mapping>``
 -  Contains one or more ``<dimension>`` elements with designspace locations.
 
- .. versionadded:: 5.1
+Each mapping ``<dimension>`` accepts, besides the usual ``name`` and
+``xvalue``, an optional ``epsilon`` attribute:
+
+- ``epsilon``: optional integer, one of ``-1``, ``0`` or ``1``. Nudges the
+  ``xvalue`` by that many normalized int16 (`F2DOT14
+  <https://learn.microsoft.com/en-us/typography/opentype/spec/otff#fixed-point-arithmetic>`_)
+  steps. One step is ``1/16384`` in normalized coordinates; its user-space
+  magnitude is derived from the axis ``minimum``/``default``/``maximum``.
+  A positive step uses the ``maximum - default`` span and a negative step
+  uses the ``default - minimum`` span, so asymmetric axes are correct on
+  both sides of the default. ``0`` and an omitted attribute mean no nudge.
+
+ .. versionadded:: 5.2
 
 
 ``<output>`` element
@@ -303,7 +315,10 @@ Example of all axis elements together
 -  Child element of ``<mapping>``
 -  Contains one or more ``<dimension>`` elements with designspace locations.
 
- .. versionadded:: 5.1
+Mapping output dimensions accept the same optional ``epsilon`` attribute as
+input dimensions.
+
+ .. versionadded:: 5.2
 
 
 Example of all mappings elements together
@@ -319,6 +334,17 @@ Example of all mappings elements together
             </input>
             <output>
                 <dimension name="weight" xvalue="870"/>
+            </output>
+        </mapping>
+        <mapping>
+            <!-- Exactly one normalized int16 step above Width=70.
+                 The user-space decimal is computed from the Width axis. -->
+            <input>
+                <dimension name="weight" xvalue="900"/>
+                <dimension name="Width" xvalue="70" epsilon="1"/>
+            </input>
+            <output>
+                <dimension name="Width" xvalue="70" epsilon="1"/>
             </output>
         </mapping>
     </mappings>

@@ -299,12 +299,15 @@ def _extractSubSpace(
                 )
                 continue
 
-        mappings.append(
-            AxisMappingDescriptor(
-                inputLocation=mapping.inputLocation,
-                outputLocation=mapping.outputLocation,
-            )
+        axisMapping = AxisMappingDescriptor(
+            inputLocation=mapping.inputLocation,
+            outputLocation=mapping.outputLocation,
+            inputEpsilon=getattr(mapping, "inputEpsilon", None),
+            outputEpsilon=getattr(mapping, "outputEpsilon", None),
         )
+        axisMapping._inputBaseLocation = getattr(mapping, "_inputBaseLocation", {})
+        axisMapping._outputBaseLocation = getattr(mapping, "_outputBaseLocation", {})
+        mappings.append(axisMapping)
 
     # Don't include STAT info
     # subDoc.locationLabels = doc.locationLabels
