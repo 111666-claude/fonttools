@@ -157,6 +157,14 @@ def overlayFeatureVariations(conditionalSubstitutions):
     substitution dictionaries.  These dictionaries are not merged to allow data
     sharing when they are converted into font tables.
 
+    The substitution dictionaries of distinct rules are always kept as separate
+    list entries, even when the rules cover the same region: each becomes its
+    own single-substitution lookup, and the lookups are applied in rule order.
+    This preserves chains of substitutions (e.g. rule 1 substitutes A with B,
+    rule 2 substitutes B with C), matching designspaceLib.processRules.
+    Identical dictionaries are deduplicated, with the earlier rule kept, so
+    conflicting rules for the same glyph still let the earlier rule win.
+
     Example::
 
         >>> condSubst = [
@@ -173,17 +181,30 @@ def overlayFeatureVariations(conditionalSubstitutions):
          ({'wdth': (0.5, 1.0)}, [{'cent': 'cent.rvrn'}]),
          ({'wght': (0.5, 1.0)}, [{'dollar': 'dollar.rvrn'}])]
 
+    Chained rules sharing a region stay as ordered, distinct lookups::
+
+        >>> condSubst = [
+        ...     ([{"wght": (0.0, 1.0)}], {"A": "B"}),
+        ...     ([{"wght": (0.0, 1.0)}], {"B": "C"}),
+        ... ]
+        >>> pprint(overlayFeatureVariations(condSubst))
+        [({'wght': (0.0, 1.0)}, [{'A': 'B'}, {'B': 'C'}])]
+
     """
 
-    # Merge same-substitutions rules, as this creates fewer number oflookups.
+    # Merge rules with identical substitution dictionaries, as this creates
+    # fewer number of lookups. The substitution dictionaries are kept as an
+    # ordered list instead of being flattened; see the note on the
+    # same-region merge below.
     merged = OrderedDict()
-    for value, key in conditionalSubstitutions:
-        key = hashdict(key)
+    for region, substitutions in conditionalSubstitutions:
+        key = hashdict(substitutions)
         if key in merged:
-            merged[key].extend(value)
+            merged[key][0].extend(region)
         else:
-            merged[key] = value
-    conditionalSubstitutions = [(v, dict(k)) for k, v in merged.items()]
+            # value is (list of region boxes, list of substitution dicts)
+            merged[key] = [list(region), [substitutions]]
+    conditionalSubstitutions = [(region, substs) for region, substs in merged.values()]
     del merged
 
     # Merge same-region rules, as this is cheaper.
@@ -191,18 +212,29 @@ def overlayFeatureVariations(conditionalSubstitutions):
     #
     # Reversing is such that earlier entries win in case of conflicting substitution
     # rules for the same region.
+    #
+    # The per-rule substitution dictionaries are kept as an ordered list instead
+    # of being flattened into a single dictionary. Each dictionary becomes its
+    # own single-substitution lookup, and the lookups are run in rule order, so
+    # chains of rules (e.g. rule 1 substitutes A with B and rule 2 substitutes
+    # B with C) are applied consecutively, matching designspaceLib.processRules.
+    # A flattened dictionary would only perform one substitution per glyph,
+    # breaking such chains. Identical dictionaries are deduplicated, with the
+    # earlier rule's copy kept, so earlier rules still win on conflicts.
     merged = OrderedDict()
-    for key, value in reversed(conditionalSubstitutions):
+    for region, substitutions in reversed(conditionalSubstitutions):
         key = tuple(
             sorted(
-                (hashdict(cleanupBox(k)) for k in key),
+                (hashdict(cleanupBox(k)) for k in region),
                 key=lambda d: tuple(sorted(d.items())),
             )
         )
         if key in merged:
-            merged[key].update(value)
+            for subst in reversed(substitutions):
+                if subst not in merged[key]:
+                    merged[key].insert(0, subst)
         else:
-            merged[key] = dict(value)
+            merged[key] = list(substitutions)
     conditionalSubstitutions = list(reversed(merged.items()))
     del merged
 
@@ -237,7 +269,10 @@ def overlayFeatureVariations(conditionalSubstitutions):
         i = 0
         while rank:
             if rank & 1:
-                substsList.append(conditionalSubstitutions[i][1])
+                # Each contributing rule carries a list of substitution
+                # dictionaries; flatten them into one ordered list so that
+                # every dictionary becomes its own lookup.
+                substsList.extend(conditionalSubstitutions[i][1])
             rank >>= 1
             i += 1
         items.append((dict(box), substsList))
