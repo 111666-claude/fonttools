@@ -274,6 +274,21 @@ Optimization options
 --no-desubroutinize [default]
   Leave CFF subroutinizes as is, only throw away unused subroutinizes.
 
+--flatten-seac
+  Replace the deprecated seac form of the 'endchar' operator in CFF fonts
+  with the actual outlines of the base and accent glyphs, offset as the
+  seac form specifies. The flattened glyphs keep their outlines, widths and
+  glyph order, but no longer depend on the referenced component glyphs, so
+  those are dropped unless they are otherwise retained. This helps fonts be
+  rendered by software that no longer supports seac. Hinting of the
+  flattened glyphs is not preserved. Character codes that do not designate
+  glyphs in the StandardEncoding are left untouched. Applies to CFF1 fonts
+  only; CFF2 has no seac form.
+
+--no-flatten-seac [default]
+  Keep the seac form as is, and retain the referenced base and accent
+  glyphs in the subset.
+
 Font table options
 ^^^^^^^^^^^^^^^^^^
 
@@ -3674,6 +3689,7 @@ class Options(object):
         self.flavor = None  # 'woff', 'woff2', or None (unspecified / uncompressed)
         self.with_zopfli = False  # use zopfli instead of zlib for WOFF 1.0
         self.desubroutinize = False  # Desubroutinize CFF CharStrings
+        self.flatten_seac = False  # Flatten CFF seac (endchar) accents
         self.harfbuzz_repacker = USE_HARFBUZZ_REPACKER.default
         self.verbose = False
         self.timing = False

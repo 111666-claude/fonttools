@@ -1,6 +1,10 @@
 4.68.0 (released 2026-10-27)
 ----------------------------
 
+- [subset] Add a ``--flatten-seac`` option that replaces the deprecated seac form
+  of the CFF1 ``endchar`` operator with the outlines of the base and accent glyphs,
+  preserving outlines, widths and glyph order while allowing the no-longer-needed
+  component glyphs to be dropped.
 - [feaLib] Escape ``"`` and ``\`` when writing names back out with ``asFea()`` in
   ``FeatureNameStatement``, ``STATNameStatement`` and ``CVParametersNameStatement``
   (#4321).

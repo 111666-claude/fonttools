@@ -3777,5 +3777,363 @@ def test_preserve_name_ids_when_used_elsewhere():
     assert all(id >= 256 or id == 5 for id in visitor.seen)
 
 
+SEAC_GLYPHS = [
+    ".notdef",
+    "A",
+    "acute",
+    "grave",
+    "Aacute",
+    "Agrave",
+    "mixed",
+    "plain",
+    "mangled",
+]
+
+
+def _make_seac_font():
+    """Build a CFF1 font with seac (endchar) composites.
+
+    - A, acute and grave are stored as subroutines (global and local).
+    - Aacute, Agrave and mixed use the seac form of endchar; mixed also has
+      a regular outline before the endchar.
+    - plain does not use the seac form.
+    - mangled uses a character code that is not in the StandardEncoding.
+    """
+    from fontTools.cffLib import SubrsIndex
+    from fontTools.misc.psCharStrings import T2CharString
+
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(SEAC_GLYPHS)
+    fb.setupCharacterMap({0x41: "Aacute", 0x60: "Agrave", 0x62: "plain"})
+    fb.setupCFF(
+        "SeacTest",
+        {},
+        {name: T2CharString(program=["endchar"]) for name in SEAC_GLYPHS},
+        {"defaultWidthX": 500, "nominalWidthX": 0},
+    )
+    cff = fb.font["CFF "].cff
+    topDict = cff[0]
+    charStrings = topDict.CharStrings
+    private = topDict.Private
+    gsubrs = cff.GlobalSubrs
+    gsubrs.append(
+        T2CharString(
+            program=[
+                10,
+                0,
+                "rmoveto",
+                0,
+                700,
+                "rlineto",
+                390,
+                0,
+                "rlineto",
+                0,
+                -700,
+                "rlineto",
+                "return",
+            ],
+            private=private,
+            globalSubrs=gsubrs,
+        )
+    )
+    private.Subrs = SubrsIndex()
+    private.Subrs.append(
+        T2CharString(
+            program=[
+                220,
+                700,
+                "rmoveto",
+                30,
+                100,
+                "rlineto",
+                50,
+                -100,
+                "rlineto",
+                "return",
+            ],
+            private=private,
+            globalSubrs=gsubrs,
+        )
+    )
+
+    def make(program):
+        return T2CharString(program=program, private=private, globalSubrs=gsubrs)
+
+    charStrings["A"] = make([600, -107, "callgsubr", "endchar"])
+    charStrings["acute"] = make([600, -107, "callsubr", "endchar"])
+    charStrings["grave"] = make(
+        [600, 200, 700, "rmoveto", -20, 100, "rlineto", 120, -80, "rlineto", "endchar"]
+    )
+    # bchar=65 ('A'), achar=194 ('acute'); omitted width (defaultWidthX).
+    charStrings["Aacute"] = make([600, 20, 10, 65, 194, "endchar"])
+    # bchar=65 ('A'), achar=193 ('grave').
+    charStrings["Agrave"] = make([20, 10, 65, 193, "endchar"])
+    # A regular outline followed by a seac composition of A and acute.
+    charStrings["mixed"] = make(
+        [600, 0, 0, "rmoveto", 50, 0, "rlineto", 20, 10, 65, 194, "endchar"]
+    )
+    charStrings["plain"] = make([600, 10, 10, "rmoveto", 100, 0, "rlineto", "endchar"])
+    # achar=1 is not in the StandardEncoding (it maps to .notdef).
+    charStrings["mangled"] = make([600, 0, 0, 65, 1, "endchar"])
+
+    fb.setupHorizontalMetrics({name: (600, 0) for name in SEAC_GLYPHS})
+    fb.setupHorizontalHeader(ascent=900, descent=-100)
+    fb.setupNameTable({"familyName": "SeacTest", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    stream = io.BytesIO()
+    fb.font.save(stream)
+    return TTFont(io.BytesIO(stream.getvalue()))
+
+
+def _draw_glyph(font, glyphName):
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
+
+    glyphSet = font.getGlyphSet()
+    pen = DecomposingRecordingPen(glyphSet)
+    glyphSet[glyphName].draw(pen)
+    return glyphSet[glyphName].width, pen.value
+
+
+def _subset_and_reload(font, glyphs, **options):
+    font = TTFont(io.BytesIO(_save(font)))
+    opts = subset.Options()
+    opts.glyph_names = True
+    for key, value in options.items():
+        setattr(opts, key, value)
+    subsetter = subset.Subsetter(opts)
+    subsetter.populate(glyphs=glyphs)
+    subsetter.subset(font)
+    return TTFont(io.BytesIO(_save(font)))
+
+
+def _save(font):
+    stream = io.BytesIO()
+    font.save(stream)
+    return stream.getvalue()
+
+
+def test_flatten_seac_preserves_outlines_widths_and_order():
+    font = _make_seac_font()
+    expected = {name: _draw_glyph(font, name) for name in ("Aacute", "Agrave", "mixed")}
+
+    subsetFont = _subset_and_reload(
+        font, ["Aacute", "Agrave", "mixed"], flatten_seac=True
+    )
+
+    # The glyph order is preserved, and the components are gone (they are not
+    # otherwise retained).
+    assert subsetFont.getGlyphOrder() == [".notdef", "Aacute", "Agrave", "mixed"]
+    for name, (width, recording) in expected.items():
+        assert _draw_glyph(subsetFont, name) == (width, recording)
+
+    # No glyph uses the seac form anymore.
+    from fontTools.subset.cff import _SeacArgsT2Decompiler
+
+    subsetFont["CFF "].cff[0].decompileAllCharStrings()
+    charStrings = subsetFont["CFF "].cff[0].CharStrings
+    for name in ("Aacute", "Agrave", "mixed"):
+        charString = charStrings[name]
+        assert charString.program.count("endchar") == 1
+        decompiler = _SeacArgsT2Decompiler(
+            [], charString.globalSubrs, 0, 0, charString.private
+        )
+        decompiler.execute(charString)
+        assert decompiler.seacArgs is None
+
+
+def test_flatten_seac_drops_unused_components_but_keeps_shared_ones():
+    font = _make_seac_font()
+    # 'acute' is requested explicitly, so it must survive flattening even
+    # though Aacute and mixed inlined it.
+    subsetFont = _subset_and_reload(
+        font, ["Aacute", "acute", "plain"], flatten_seac=True
+    )
+    assert subsetFont.getGlyphOrder() == [".notdef", "acute", "Aacute", "plain"]
+    # 'A' and 'grave' were only reachable through the seac form.
+    assert "A" not in subsetFont.getGlyphOrder()
+    assert "grave" not in subsetFont.getGlyphOrder()
+    # 'acute' is unchanged, and still declares the local subroutine.
+    acute = subsetFont["CFF "].cff[0].CharStrings["acute"]
+    acute.decompile()
+    assert acute.program[-2:] in (["callsubr", "endchar"], ["callsubr", "return"])
+    assert _draw_glyph(subsetFont, "acute") == _draw_glyph(font, "acute")
+
+
+def test_flatten_seac_disabled_keeps_seac_closure():
+    font = _make_seac_font()
+    subsetFont = _subset_and_reload(font, ["Aacute"])
+    assert subsetFont.getGlyphOrder() == [".notdef", "A", "acute", "Aacute"]
+    charString = subsetFont["CFF "].cff[0].CharStrings["Aacute"]
+    charString.decompile()
+    assert charString.program[-4:] == [10, 65, 194, "endchar"]
+
+
+def test_flatten_seac_keeps_exact_charstring_width():
+    # The width is stored as the difference from nominalWidthX and may be
+    # fractional; flattening must not round it.
+    from fontTools.misc.psCharStrings import T2CharString
+    from fontTools.pens.basePen import NullPen
+
+    order = [".notdef", "A", "acute", "Aacute", "Agrave"]
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({0x41: "Aacute", 0x60: "Agrave"})
+    fb.setupCFF(
+        "WidthSeac",
+        {},
+        {name: T2CharString(program=["endchar"]) for name in order},
+        {"defaultWidthX": 500, "nominalWidthX": 50},
+    )
+    cff = fb.font["CFF "].cff
+    topDict = cff[0]
+    private = topDict.Private
+
+    def make(program):
+        return T2CharString(
+            program=program, private=private, globalSubrs=cff.GlobalSubrs
+        )
+
+    topDict.CharStrings["A"] = make([10, 0, "rmoveto", 100, 0, "rlineto", "endchar"])
+    topDict.CharStrings["acute"] = make(
+        [200, 700, "rmoveto", 30, 100, "rlineto", "endchar"]
+    )
+    # nominalWidthX=50 and width operand 12.5 -> charstring width 62.5.
+    topDict.CharStrings["Aacute"] = make([12.5, 0, 0, 65, 194, "endchar"])
+    # No width operand: defaultWidthX.
+    topDict.CharStrings["Agrave"] = make([0, 0, 65, 194, "endchar"])
+    fb.setupHorizontalMetrics({name: (600, 0) for name in order})
+    fb.setupHorizontalHeader(ascent=900, descent=-100)
+    fb.setupNameTable({"familyName": "WidthSeac", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    font = _make_roundtripped(fb.font)
+
+    widths = {}
+    for name in ("Aacute", "Agrave"):
+        charString = font["CFF "].cff[0].CharStrings[name]
+        charString.draw(NullPen())
+        widths[name] = charString.width
+
+    subsetFont = _subset_and_reload(font, ["Aacute", "Agrave"], flatten_seac=True)
+    for name, expectedWidth in widths.items():
+        charString = subsetFont["CFF "].cff[0].CharStrings[name]
+        charString.draw(NullPen())
+        assert charString.width == expectedWidth
+
+
+@pytest.mark.parametrize("retain_gids", [False, True])
+def test_flatten_seac_retain_gids(retain_gids):
+    font = _make_seac_font()
+    expected = _draw_glyph(font, "Aacute")
+    subsetFont = _subset_and_reload(
+        font, ["Aacute"], flatten_seac=True, retain_gids=retain_gids
+    )
+    if retain_gids:
+        assert subsetFont.getGlyphOrder() == SEAC_GLYPHS[:5]
+    else:
+        assert subsetFont.getGlyphOrder() == [".notdef", "Aacute"]
+    assert _draw_glyph(subsetFont, "Aacute") == expected
+
+
+@pytest.mark.parametrize("flatten_seac", [False, True])
+def test_flatten_seac_leaves_mangled_code_untouched(flatten_seac):
+    font = _make_seac_font()
+    with CapturingLogHandler("fontTools.subset", "WARNING") as captor:
+        subsetFont = _subset_and_reload(font, ["mangled"], flatten_seac=flatten_seac)
+    if flatten_seac:
+        assert any("Cannot flatten seac" in r.getMessage() for r in captor.records)
+    else:
+        assert not captor.records
+    assert _draw_glyph(subsetFont, "mangled") == _draw_glyph(font, "mangled")
+    charString = subsetFont["CFF "].cff[0].CharStrings["mangled"]
+    charString.decompile()
+    assert charString.program[-5:] == [0, 0, 65, 1, "endchar"]
+
+
+def test_flatten_seac_nested():
+    # The base glyph itself uses the seac form; flattening must recurse, and
+    # neither component should be retained.
+    from fontTools.misc.psCharStrings import T2CharString
+
+    order = [".notdef", "B", "acute", "A", "Aacute"]
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({0x41: "Aacute"})
+    fb.setupCFF(
+        "NestedSeac",
+        {},
+        {name: T2CharString(program=["endchar"]) for name in order},
+        {"defaultWidthX": 0, "nominalWidthX": 0},
+    )
+    cff = fb.font["CFF "].cff
+    topDict = cff[0]
+    private = topDict.Private
+
+    def make(program):
+        return T2CharString(
+            program=program, private=private, globalSubrs=cff.GlobalSubrs
+        )
+
+    topDict.CharStrings["B"] = make(
+        [600, 10, 0, "rmoveto", 100, 0, "rlineto", 0, 100, "rlineto", "endchar"]
+    )
+    topDict.CharStrings["acute"] = make(
+        [600, 200, 700, "rmoveto", 30, 100, "rlineto", 50, -100, "rlineto", "endchar"]
+    )
+    # 'A' is itself a seac composition of B and acute.
+    topDict.CharStrings["A"] = make([600, 0, 0, 66, 194, "endchar"])
+    # Aacute is a seac composition of A and acute.
+    topDict.CharStrings["Aacute"] = make([600, 5, 5, 65, 194, "endchar"])
+    fb.setupHorizontalMetrics({name: (600, 0) for name in order})
+    fb.setupHorizontalHeader(ascent=900, descent=-100)
+    fb.setupNameTable({"familyName": "NestedSeac", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    font = _make_roundtripped(fb.font)
+
+    expected = _draw_glyph(font, "Aacute")
+    subsetFont = _subset_and_reload(font, ["Aacute"], flatten_seac=True)
+    assert subsetFont.getGlyphOrder() == [".notdef", "Aacute"]
+    assert _draw_glyph(subsetFont, "Aacute") == expected
+
+
+def test_flatten_seac_ignored_for_cff2():
+    # CFF2 has no endchar operator, so the option is a no-op there.
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+
+    fb = FontBuilder(1000, isTTF=False)
+    order = [".notdef", "A", "acute"]
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({0x41: "A"})
+    pen = T2CharStringPen(None, None, CFF2=True)
+    pen.moveTo((10, 0))
+    pen.lineTo((10, 700))
+    pen.closePath()
+    charStrings = {name: pen.getCharString() for name in order}
+    fb.setupCFF2(charStrings)
+    fb.setupHorizontalMetrics({name: (600, 0) for name in order})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": "CFF2Test", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    font = _make_roundtripped(fb.font)
+
+    expected = _draw_glyph(font, "A")
+    options = subset.Options()
+    options.glyph_names = True
+    options.flatten_seac = True
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(glyphs=["A"])
+    subsetter.subset(font)
+    font = TTFont(io.BytesIO(_save(font)))
+    assert _draw_glyph(font, "A") == expected
+
+
+def _make_roundtripped(font):
+    return TTFont(io.BytesIO(_save(font)))
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
