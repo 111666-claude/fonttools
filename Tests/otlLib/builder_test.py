@@ -1101,6 +1101,277 @@ class BuilderTest(object):
         assert hash(keyA1) != hash(keyB)
 
 
+class PairPosClassBatchingTest(object):
+    """Tests for ClassPairPosSubtableBuilder / PairPosBuilder class batching.
+
+    These guard the rule that the format-2 PairPos subtables produced for one
+    lookup have pairwise-disjoint Coverage tables (within an automatic
+    batching segment): an engine stops at the first subtable covering a first
+    glyph, so an overlapping coverage would shadow later rules and yield an
+    empty adjustment for some glyph pairs.
+    """
+
+    GLYPHS = ".notdef A B C D E F X Y Z".split()
+
+    def _font(self):
+        font = ttLib.TTFont()
+        font.setGlyphOrder(self.GLYPHS)
+        return font
+
+    @staticmethod
+    def _value(xAdvance=None):
+        if xAdvance is None:
+            return builder.buildValue({})
+        return builder.buildValue({"XAdvance": xAdvance})
+
+    def _build(self, rules, extension=False, breaks=()):
+        font = self._font()
+        pb = builder.PairPosBuilder(font, ("test.fea", 1, 0))
+        pb.extension = extension
+        for index, (gc1, v1, gc2, v2) in enumerate(rules):
+            if index in breaks:
+                pb.add_subtable_break(None)
+            pb.addClassPair(
+                None, tuple(gc1), self._value(v1), tuple(gc2), self._value(v2)
+            )
+        return pb.build()
+
+    @staticmethod
+    def _concreteKerns(lookup):
+        # First-subtable-match evaluation over the built lookup, mirroring how
+        # an OpenType engine consumes a PairPos lookup.
+        out = {}
+        for subtable in lookup.SubTable:
+            sub = getattr(subtable, "ExtSubTable", subtable)
+            classDef1 = sub.ClassDef1.classDefs
+            classDef2 = sub.ClassDef2.classDefs
+            for first in sub.Coverage.glyphs:
+                c1 = classDef1.get(first, 0)
+                for second, c2 in classDef2.items():
+                    record = sub.Class1Record[c1].Class2Record[c2]
+                    value = record.Value1
+                    if value is not None and value.XAdvance:
+                        out.setdefault((first, second), value.XAdvance)
+        return out
+
+    @staticmethod
+    def _coverages(lookup):
+        return [
+            set(getattr(s, "ExtSubTable", s).Coverage.glyphs) for s in lookup.SubTable
+        ]
+
+    def _assertDisjointCoverage(self, lookup):
+        seen = set()
+        for coverage in self._coverages(lookup):
+            assert coverage.isdisjoint(seen)
+            seen |= coverage
+
+    def test_overlapping_first_glyph_class_not_shadowed(self):
+        # The reported bug: rule 2's first-glyph class is a subset of rule 1's
+        # class but uses a different second glyph. Both rules must survive.
+        lookup = self._build(
+            [
+                (["A", "B"], -100, ["C"], 0),
+                (["A"], -200, ["D"], 0),
+            ]
+        )
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "C"): -100,
+            ("B", "C"): -100,
+            ("A", "D"): -200,
+        }
+
+    def test_first_glyph_class_order_independent(self):
+        rules_a = [
+            (["B", "A"], -100, ["C"], 0),
+            (["A"], -200, ["D"], 0),
+        ]
+        rules_b = [
+            (["A", "B"], -100, ["C"], 0),
+            (["A"], -200, ["D"], 0),
+        ]
+        kerns = [self._concreteKerns(self._build(r)) for r in (rules_a, rules_b)]
+        assert kerns[0] == kerns[1]
+        assert kerns[0] == {
+            ("A", "C"): -100,
+            ("B", "C"): -100,
+            ("A", "D"): -200,
+        }
+
+    def test_nested_overlapping_classes(self):
+        lookup = self._build(
+            [
+                (["A", "B", "C"], -1, ["X"], 0),
+                (["A", "B"], -2, ["Y"], 0),
+                (["A"], -3, ["Z"], 0),
+            ]
+        )
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "X"): -1,
+            ("B", "X"): -1,
+            ("C", "X"): -1,
+            ("A", "Y"): -2,
+            ("B", "Y"): -2,
+            ("A", "Z"): -3,
+        }
+
+    def test_disjoint_rules_share_one_subtable(self):
+        # Mutually disjoint rules must not cause subtable bloat.
+        lookup = self._build(
+            [
+                (["A"], -1, ["C"], 0),
+                (["B"], -2, ["D"], 0),
+                (["E"], -3, ["F"], 0),
+            ]
+        )
+        assert len(lookup.SubTable) == 1
+        assert self._concreteKerns(lookup) == {
+            ("A", "C"): -1,
+            ("B", "D"): -2,
+            ("E", "F"): -3,
+        }
+
+    def test_shared_second_glyph_class_distinct_values(self):
+        # Same second-glyph class, different first-glyph values: the values
+        # must not be merged onto the wrong first glyph.
+        lookup = self._build(
+            [
+                (["A"], -1, ["X", "Y"], 0),
+                (["B"], -2, ["X", "Y"], 0),
+            ]
+        )
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "X"): -1,
+            ("A", "Y"): -1,
+            ("B", "X"): -2,
+            ("B", "Y"): -2,
+        }
+
+    def test_partially_overlapping_second_glyph_class_splits(self):
+        # ClassDef2 cannot encode two partially overlapping classes in one
+        # subtable, so a second subtable is needed; coverages stay disjoint.
+        lookup = self._build(
+            [
+                (["A"], -1, ["X", "Y"], 0),
+                (["B"], -2, ["Y", "Z"], 0),
+            ]
+        )
+        assert len(lookup.SubTable) == 2
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "X"): -1,
+            ("A", "Y"): -1,
+            ("B", "Y"): -2,
+            ("B", "Z"): -2,
+        }
+
+    def test_duplicate_concrete_pair_first_wins(self):
+        lookup = self._build(
+            [
+                (["A"], -11, ["C"], 0),
+                (["A"], -99, ["C"], 0),
+            ]
+        )
+        assert self._concreteKerns(lookup) == {("A", "C"): -11}
+
+    def test_overlapping_second_class_on_same_first_glyph(self):
+        # Two rules with the same first glyph but partially overlapping
+        # second-glyph classes ({X,Y} then {Y,Z}). This used to crash while
+        # building ClassDef2; it must now compile with disjoint coverages,
+        # keep the earlier rule's value on the shared glyph (Y), and apply
+        # the later rule to the new glyph (Z).
+        lookup = self._build(
+            [
+                (["A"], -1, ["X", "Y"], 0),
+                (["A"], -9, ["Y", "Z"], 0),
+            ]
+        )
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "X"): -1,
+            ("A", "Y"): -1,
+            ("A", "Z"): -9,
+        }
+
+    def test_second_class_refinement_does_not_leak_value(self):
+        # A second glyph (Y) is first grouped with Z by an earlier rule; a
+        # later rule groups Y with different partners. Refining Y into its own
+        # class must not let the later rule's value leak onto Z, which that
+        # rule never covered. Every concrete pair keeps its declared value.
+        lookup = self._build(
+            [
+                (["A"], -6, ["Y", "Z"], 0),
+                (["A", "B"], -44, ["X", "Y"], 0),
+                (["A"], -36, ["Z"], 0),
+            ]
+        )
+        self._assertDisjointCoverage(lookup)
+        assert self._concreteKerns(lookup) == {
+            ("A", "Y"): -6,
+            ("A", "Z"): -6,
+            ("A", "X"): -44,
+            ("B", "X"): -44,
+            ("B", "Y"): -44,
+        }
+
+    def test_zero_adjustment_round_trips(self):
+        lookup = self._build(
+            [
+                (["A", "B"], 0, ["C"], 0),
+                (["A"], 0, ["D"], 0),
+            ]
+        )
+        # Compile through a full GPOS table and decompile; the lookup must
+        # survive the binary round-trip without error and keep its subtables.
+        font = self._font()
+        gpos = ttLib.newTable("GPOS")
+        gpos.table = otTables.GPOS()
+        gpos.table.Version = 0x00010000
+        gpos.table.ScriptList = otTables.ScriptList()
+        gpos.table.ScriptList.ScriptRecord = []
+        gpos.table.FeatureList = otTables.FeatureList()
+        gpos.table.FeatureList.FeatureRecord = []
+        gpos.table.LookupList = otTables.LookupList()
+        gpos.table.LookupList.Lookup = [lookup]
+        data = gpos.compile(font)
+
+        reloaded = ttLib.newTable("GPOS")
+        reloaded.decompile(data, font)
+        reloaded_lookup = reloaded.table.LookupList.Lookup[0]
+        assert len(reloaded_lookup.SubTable) == len(lookup.SubTable)
+
+    def test_explicit_subtable_break_is_respected(self):
+        lookup = self._build(
+            [
+                (["A"], -1, ["C"], 0),
+                (["B"], -2, ["D"], 0),
+            ],
+            breaks={1},
+        )
+        # The break forces a boundary even though the rules could merge.
+        assert len(lookup.SubTable) == 2
+
+    @pytest.mark.parametrize("extension", [False, True])
+    def test_extension_lookup(self, extension):
+        lookup = self._build(
+            [
+                (["A", "B"], -100, ["C"], 0),
+                (["A"], -200, ["D"], 0),
+            ],
+            extension=extension,
+        )
+        if extension:
+            assert all(s.ExtensionLookupType == 2 for s in lookup.SubTable)
+        assert self._concreteKerns(lookup) == {
+            ("A", "C"): -100,
+            ("B", "C"): -100,
+            ("A", "D"): -200,
+        }
+
+
 class ClassDefBuilderTest(object):
     def test_build_usingClass0(self):
         b = builder.ClassDefBuilder(useClass0=True)

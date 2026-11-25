@@ -1585,16 +1585,50 @@ class ClassPairPosSubtableBuilder(object):
     but builds a list of ``otTables.PairPos`` subtables. It is used by the
     :class:`PairPosBuilder` below.
 
+    A single format-2 PairPos subtable encodes its rules as a matrix of
+    non-overlapping glyph classes: every glyph may belong to at most one
+    class in each of the subtable's ``ClassDef1`` and ``ClassDef2``. When
+    the incoming rules cannot satisfy that requirement, they have to be
+    spread over several subtables.
+
+    The hard constraint is that the ``Coverage`` tables (the union of the
+    first-glyph classes) of the emitted subtables must be pairwise
+    disjoint. An OpenType layout engine stops at the first subtable whose
+    coverage contains the first glyph of a pair, even when that subtable has
+    no value for the pair's second glyph; it never falls through to a later
+    subtable. Two subtables whose coverages share a glyph would therefore
+    shadow each other, so some pairs would be positioned with an empty value
+    instead of the value written for them in the later subtable.
+
+    To keep coverages disjoint while still merging as many rules as
+    possible, first-glyph classes are treated as sets of individual glyphs
+    that may be split across subtables. A rule is distributed, glyph by
+    glyph, over the existing batches whose class definitions can still take
+    it; the glyphs that conflict with every existing batch open a new batch.
+    Rules with disjoint first- and second-glyph classes keep backfilling the
+    earliest batch they fit, so unrelated rules still share a subtable and
+    the number of subtables does not grow unnecessarily. Rules are handled
+    in input order, so when two rules overlap on a concrete glyph pair the
+    earlier rule occupies an earlier subtable and wins, matching the
+    feature-file "first definition wins" semantics.
+
+    The rules are buffered and the subtables are only produced when
+    :meth:`subtables` is called, because distributing a rule correctly needs
+    the batches built by the rules that precede it. Explicit subtable breaks,
+    passed through :meth:`addSubtableBreak`, delimit independent segments:
+    batches are never shared across a break, so rules after a break always
+    land in later subtables than rules before it.
+
     Attributes:
         builder (PairPosBuilder): A pair positioning lookup builder.
     """
 
     def __init__(self, builder):
         self.builder_ = builder
-        self.classDef1_, self.classDef2_ = None, None
-        self.values_ = {}  # (glyphclass1, glyphclass2) --> (value1, value2)
-        self.forceSubtableBreak_ = False
-        self.subtables_ = []
+        # Buffered input rules, in input order. A None entry marks an
+        # explicit subtable break.
+        self.rules_ = []
+        self.subtables_ = None
 
     def addPair(self, gc1, value1, gc2, value2):
         """Add a pair positioning rule.
@@ -1607,39 +1641,217 @@ class ClassPairPosSubtableBuilder(object):
             value2: An ``otTables.ValueRecord`` object for the right glyph's
                 positioning.
         """
-        mergeable = (
-            not self.forceSubtableBreak_
-            and self.classDef1_ is not None
-            and self.classDef1_.canAdd(gc1)
-            and self.classDef2_ is not None
-            and self.classDef2_.canAdd(gc2)
-        )
-        if not mergeable:
-            self.flush_()
-            self.classDef1_ = ClassDefBuilder(useClass0=True)
-            self.classDef2_ = ClassDefBuilder(useClass0=False)
-            self.values_ = {}
-        self.classDef1_.add(gc1)
-        self.classDef2_.add(gc2)
-        self.values_[(gc1, gc2)] = (value1, value2)
+        self.rules_.append((gc1, value1, gc2, value2))
 
     def addSubtableBreak(self):
         """Add an explicit subtable break at this point."""
-        self.forceSubtableBreak_ = True
+        self.rules_.append(None)
 
     def subtables(self):
         """Return the list of ``otTables.PairPos`` subtables constructed."""
-        self.flush_()
+        if self.subtables_ is None:
+            self.subtables_ = self._buildSubtables()
         return self.subtables_
 
-    def flush_(self):
-        if self.classDef1_ is None or self.classDef2_ is None:
-            return
-        st = buildPairPosClassesSubtable(self.values_, self.builder_.glyphMap)
-        if st.Coverage is None:
-            return
-        self.subtables_.append(st)
-        self.forceSubtableBreak_ = False
+    def _buildSubtables(self):
+        # Split the buffered rules at explicit subtable breaks; each segment
+        # is then partitioned independently into disjoint-coverage batches.
+        segments = [[]]
+        for rule in self.rules_:
+            if rule is None:
+                segments.append([])
+            else:
+                segments[-1].append(rule)
+
+        result = []
+        for segment in segments:
+            result.extend(self._buildSegmentSubtables(segment))
+        return result
+
+    def _buildSegmentSubtables(self, rules):
+        # Partition the rules of one segment (the rules between two explicit
+        # subtable breaks) into batches that each become one PairPos format-2
+        # subtable. The algorithm runs in two stages.
+        #
+        # Stage 1 assigns every concrete first glyph to exactly one batch and
+        # records, per batch, the concrete (first glyph, second glyph) pairs
+        # the rules produce. ``owner`` maps each first glyph to its batch;
+        # routing a glyph through one fixed batch is what makes the emitted
+        # Coverage tables pairwise disjoint, so an engine stopping at the
+        # first covering subtable can never skip a subtable that holds the
+        # pair's value. An unassigned glyph is placed in the earliest batch
+        # whose ClassDef2 can still encode the rule's second-glyph class,
+        # opening a new batch only when none can; this backfills disjoint
+        # rules and keeps the subtable count minimal. First definition wins
+        # on any concrete pair collision.
+        owner = {}  # first-glyph glyph --> batch index
+        secondClasses = []  # per batch: second glyph --> gc2 class tuple
+        concretePairs = []  # per batch: (g1, g2) --> (value1, value2)
+
+        for gc1, value1, gc2, value2 in rules:
+            owned = {}  # batch index --> first glyphs of this rule in it
+            unowned = []
+            for glyph in gc1:
+                if glyph in owner:
+                    owned.setdefault(owner[glyph], []).append(glyph)
+                else:
+                    unowned.append(glyph)
+
+            if unowned:
+                target = self._pickBatch(secondClasses, set(owned), gc2)
+                if target is None:
+                    target = len(concretePairs)
+                    secondClasses.append({})
+                    concretePairs.append({})
+                for glyph in unowned:
+                    owner[glyph] = target
+                owned.setdefault(target, []).extend(unowned)
+
+            for batchIndex, glyphs in owned.items():
+                class2Map = secondClasses[batchIndex]
+                pairs = concretePairs[batchIndex]
+                # Split gc2 along the ClassDef2 classes already present in
+                # this batch, so a partially-overlapping second-glyph class
+                # never forces an illegal re-classification. Conflicting
+                # second glyphs keep their earlier (higher-priority) class;
+                # the genuinely new glyphs are grouped into one new class.
+                for class2 in self._secondClassFragments(class2Map, gc2):
+                    for first in glyphs:
+                        for second in class2:
+                            pairs.setdefault((first, second), (value1, value2))
+
+        # Stage 2 rebuilds the ClassDef1/ClassDef2 classes for each batch from
+        # its concrete pairs. First glyphs are grouped into a class only when
+        # they have identical rows (the same second glyphs with the same
+        # values), which prevents a shared class from leaking a value onto a
+        # glyph the rule never covered. Second glyphs reuse the classes fixed
+        # in stage 1, which are already non-overlapping within the batch.
+        result = []
+        for pairs, class2Map in zip(concretePairs, secondClasses):
+            values = self._rebuildClassValues(pairs, class2Map)
+            st = buildPairPosClassesSubtable(values, self.builder_.glyphMap)
+            if st.Coverage is not None:
+                result.append(st)
+        return result
+
+    @staticmethod
+    def _secondClassFragments(secondClasses, gc2):
+        # Split a rule's second-glyph class into the ClassDef2 classes that
+        # represent it inside one batch, binding any still-unbound glyphs.
+        #
+        # Returns the class tuples the rule's concrete second glyphs belong
+        # to. A glyph already bound to a class wholly contained in gc2 keeps
+        # that class. A glyph bound to a class extending outside gc2 is a
+        # conflict (two rules want the glyph grouped with different partners);
+        # it is split out into its own class. Splitting removes the glyph from
+        # its old class and rebinds the remaining (out-of-gc2) members to the
+        # shortened class; those members are not returned, since their pairs
+        # are owned by earlier rules and must not take this rule's value.
+        # Still-unbound glyphs are grouped into one new class to keep
+        # ClassDef2 compact.
+        cls = tuple(sorted(gc2))
+        compatible = all(
+            glyph not in secondClasses or secondClasses[glyph] == cls for glyph in gc2
+        )
+        if compatible:
+            for glyph in gc2:
+                secondClasses.setdefault(glyph, cls)
+            return [cls]
+
+        fragments = []
+        seenClasses = set()
+        fresh = []
+
+        def emit(classTuple):
+            if classTuple not in seenClasses:
+                seenClasses.add(classTuple)
+                fragments.append(classTuple)
+
+        for glyph in gc2:
+            existing = secondClasses.get(glyph)
+            if existing is None:
+                fresh.append(glyph)
+            elif all(member in cls for member in existing):
+                emit(existing)
+            else:
+                # Conflict: split ``glyph`` out of its current class and
+                # rebind the remaining members to the shortened class. The
+                # remaining glyphs are outside this rule's gc2, so the
+                # shortened class is *not* returned as a fragment: its pairs
+                # are owned by earlier rules and must not receive this rule's
+                # value. Only the split-out glyph (which is in gc2) gets the
+                # new value through its singleton class.
+                remaining = tuple(sorted(g for g in existing if g != glyph))
+                for member in remaining:
+                    secondClasses[member] = remaining
+                singleton = (glyph,)
+                secondClasses[glyph] = singleton
+                emit(singleton)
+        if fresh:
+            newClass = tuple(sorted(fresh))
+            for glyph in fresh:
+                secondClasses[glyph] = newClass
+            emit(newClass)
+        return fragments
+
+    @staticmethod
+    def _pickBatch(secondClasses, forbidden, gc2):
+        # Earliest batch allowed to own still-unassigned first glyphs of a
+        # rule. Batches already reached through another (owned) glyph of the
+        # same rule are excluded because the rule's first-glyph class has to
+        # be split there; among the rest, pick the first whose ClassDef2 can
+        # encode the rule's second-glyph class.
+        cls = tuple(sorted(gc2))
+        for index, class2Map in enumerate(secondClasses):
+            if index in forbidden:
+                continue
+            if all(glyph not in class2Map or class2Map[glyph] == cls for glyph in gc2):
+                return index
+        return None
+
+    @staticmethod
+    def _rebuildClassValues(concretePairs, secondClasses):
+        # Build the (class1, class2) -> (value1, value2) mapping from the
+        # final concrete pairs and the final second-glyph class assignment.
+        # Returns the mapping expected by buildPairPosClassesSubtable.
+        #
+        # ClassDef2 classes may have been refined while the rules were added,
+        # so the authoritative class of every second glyph is the one it has
+        # in ``secondClasses`` once all rules have been seen. A first glyph's
+        # signature records, for each concrete second glyph together with its
+        # value, the ClassDef2 class that glyph finally belongs to; first
+        # glyphs with identical signatures are grouped into one ClassDef1
+        # class. Distinct values keep glyphs in distinct classes, so a value
+        # can never leak onto a glyph a rule did not cover.
+        rows = {}  # first glyph --> list of (class2, second, id(v1), id(v2))
+        for (first, second), (value1, value2) in concretePairs.items():
+            rows.setdefault(first, []).append(
+                (secondClasses[second], second, id(value1), id(value2))
+            )
+        signatures = {first: tuple(sorted(row)) for first, row in rows.items()}
+
+        class1Groups = []  # lists of first glyphs sharing a signature
+        groupIndex = {}
+        for first in sorted(signatures):
+            sig = signatures[first]
+            if sig in groupIndex:
+                class1Groups[groupIndex[sig]].append(first)
+            else:
+                groupIndex[sig] = len(class1Groups)
+                class1Groups.append([first])
+
+        values = {}
+        for group in class1Groups:
+            class1 = tuple(sorted(group))
+            # One value cell per ClassDef2 class appearing in this group's
+            # rows. Every member shares the signature, so reading the value
+            # from any one concrete pair for that class is sufficient.
+            perSecondClass = {}
+            for class2, second, _, _ in signatures[group[0]]:
+                perSecondClass[class2] = concretePairs[(group[0], second)]
+            for class2, pairValues in perSecondClass.items():
+                values[(class1, class2)] = pairValues
+        return values
 
 
 class PairPosBuilder(LookupBuilder):
