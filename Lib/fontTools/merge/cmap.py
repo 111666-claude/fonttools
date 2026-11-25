@@ -5,6 +5,7 @@
 from fontTools.merge.unicode import is_Default_Ignorable
 from fontTools.pens.recordingPen import DecomposingRecordingPen
 import logging
+import struct
 
 log = logging.getLogger("fontTools.merge")
 
@@ -157,6 +158,45 @@ def computeMegaCmap(merger, cmapTables):
                     )
 
     merger.uvsDict = computeMegaUvs(merger, chosenUvsTables)
+
+
+def cmapPostMerge(font):
+    """Make sure the merged BMP subtable can actually be serialized.
+
+    The merger always builds a format 4 subtable for the BMP mapping.  Its
+    ``length``, ``idRangeOffset`` and glyph ID fields are all 16-bit, so a
+    large merged cmap (e.g. two fonts with 20,000 BMP mappings each) can fit in
+    memory yet fail with ``struct.error`` when the font is saved.  Detect that
+    here, once the final glyph order is known, and fall back to a format 12
+    subtable, which has 32-bit lengths and glyph IDs and can represent the same
+    mapping.  Small cmaps keep their format 4 subtable unchanged.
+    """
+    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
+
+    if "cmap" not in font:
+        return
+    cmap = font["cmap"]
+    for index, subtable in enumerate(cmap.tables):
+        if subtable.format != 4:
+            continue
+        try:
+            subtable.compile(font)
+        except (struct.error, OverflowError):
+            # Format 4's length and array offsets are limited to 16 bits.
+            full = cmap.getcmap(3, 10)
+            if full is None:
+                full = CmapSubtable.newSubtable(12)
+                full.platformID, full.platEncID, full.language = 3, 10, 0
+                full.cmap = subtable.cmap
+                cmap.tables[index] = full
+            else:
+                # The format 12 subtable already carries the full mapping.
+                del cmap.tables[index]
+            cmap.numSubTables = len(cmap.tables)
+            log.warning(
+                "Merged BMP cmap is too large for format 4; using cmap format 12."
+            )
+        break
 
 
 def renameCFFCharStrings(merger, glyphOrder, cffTable):

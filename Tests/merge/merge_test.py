@@ -1,5 +1,6 @@
 import io
 import itertools
+import struct
 from fontTools import ttLib
 from fontTools.ttLib.tables._g_l_y_f import Glyph
 from fontTools.fontBuilder import FontBuilder
@@ -344,11 +345,173 @@ def _make_fontfile_with_OS2(*, version, **kwargs):
     return _compile(fb.font)
 
 
+def _make_fontfile_with_glyphs(first_gid, glyph_count):
+    upem = 1000
+    glyphOrder = [".notdef"] + [
+        f"glyph{gid:05d}" for gid in range(first_gid, first_gid + glyph_count - 1)
+    ]
+    cmap = {
+        first_gid + codepoint: glyphName
+        for codepoint, glyphName in enumerate(glyphOrder[1:])
+    }
+    glyphs = {gn: Glyph() for gn in glyphOrder}
+    hmtx = {gn: (500, 0) for gn in glyphOrder}
+    names = {"familyName": "TestMerge", "styleName": "Regular"}
+
+    fb = FontBuilder(unitsPerEm=upem)
+    fb.setupGlyphOrder(glyphOrder)
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(hmtx)
+    fb.setupHorizontalHeader()
+    fb.setupNameTable(names)
+    fb.setupOS2()
+
+    return _compile(fb.font)
+
+
 def _merge_and_recompile(fontfiles, options=None):
     merger = Merger(options)
     merged = merger.merge(fontfiles)
     buf = _compile(merged)
     return ttLib.TTFont(buf)
+
+
+def _make_cmap_overflow_font(
+    first_gid, start, count, *, with_uvs=False, non_bmp=False, extra=False
+):
+    """Build a font mapping ``count`` consecutive BMP codepoints from ``start``
+    alternately to two glyphs, so that a merged format 4 subtable needs one
+    glyphIndexArray entry per codepoint.
+
+    Two fonts built with different ``first_gid`` values contribute disjoint
+    glyphs; merging them produces a BMP map that straddles format 4's 16-bit
+    size limit. With ``with_uvs`` a default and a non-default variation
+    sequence are added for the first two codepoints.
+
+    Returns ``(fontfile, cmap, expected_uvs)``.
+    """
+    font = ttLib.TTFont(_make_fontfile_with_glyphs(first_gid, 3))
+    font.ensureDecompiled()
+    glyphs = font.getGlyphOrder()[1:]
+    cmap = {start + i: glyphs[i % 2] for i in range(count)}
+    if non_bmp:
+        cmap[0x10000] = glyphs[0]
+    if extra:
+        cmap[start + count + 5] = glyphs[0]
+    uvs = None
+    expected_uvs = []
+    if with_uvs:
+        uvs = [(start, 0xFE0F, None), (start + 1, 0xFE0F, glyphs[0])]
+        expected_uvs = [(start, None), (start + 1, glyphs[0])]
+    fb = FontBuilder(font=font)
+    fb.setupCharacterMap(cmap, uvs=uvs)
+    fb.setupOS2()
+    fb.setupPost()
+    return _compile(font), cmap, expected_uvs
+
+
+def _assert_cmap_and_uvs_roundtrip(merged, expected_cmap, expected_uvs, order=None):
+    assert merged.getBestCmap() == expected_cmap
+    uvs = merged["cmap"].getcmap(0, 5)
+    if expected_uvs is None:
+        assert uvs is None
+    else:
+        actual = {
+            selector: dict(mappings) for selector, mappings in uvs.uvsDict.items()
+        }
+        assert actual == {0xFE0F: dict(expected_uvs)}
+    if order is not None:
+        assert [t.format for t in merged["cmap"].tables] == order
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize(
+    "non_bmp, extra_range",
+    [(False, False), (True, False), (False, True)],
+)
+def test_merge_cmap_exceeding_format4_capacity(non_bmp, extra_range, reverse_order):
+    # Two fonts of 20,000 BMP mappings each: the merged format 4 subtable
+    # cannot be written, so the merger must fall back to format 12 while
+    # keeping every mapping and the UVS subtable.
+    fontfiles = []
+    expected_cmap = {}
+    expected_uvs = []
+    for first_gid, start in [(0x20, 0x800), (0x40, 0x800 + 20000)]:
+        font, cmap, uvs = _make_cmap_overflow_font(
+            first_gid,
+            start,
+            20000,
+            with_uvs=True,
+            non_bmp=non_bmp and first_gid == 0x40,
+            extra=extra_range and first_gid == 0x40,
+        )
+        fontfiles.append(font)
+        expected_cmap.update(cmap)
+        expected_uvs.extend(uvs)
+    if reverse_order:
+        fontfiles.reverse()
+
+    merged = _merge_and_recompile(fontfiles)
+    _assert_cmap_and_uvs_roundtrip(merged, expected_cmap, expected_uvs, order=[14, 12])
+    assert merged["cmap"].getcmap(3, 1) is None
+
+
+@pytest.mark.parametrize(
+    "extra_entry, expected_formats",
+    [
+        # 32,750 BMP mappings compile to a format 4 subtable of 65,532 bytes.
+        (False, [4]),
+        # One more mapping pushes the subtable past 16 bits.
+        (True, [12]),
+    ],
+)
+def test_merge_cmap_format4_capacity_boundary(extra_entry, expected_formats):
+    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
+
+    count = 16375
+    fontfiles = []
+    expected_cmap = {}
+    expected_uvs = []
+    for first_gid, start in [(0x20, 0x800), (0x40, 0x800 + count)]:
+        font, cmap, uvs = _make_cmap_overflow_font(
+            first_gid,
+            start,
+            count,
+            with_uvs=True,
+            extra=extra_entry and first_gid == 0x40,
+        )
+        fontfiles.append(font)
+        expected_cmap.update(cmap)
+        expected_uvs.extend(uvs)
+
+    merged = _merge_and_recompile(fontfiles)
+    _assert_cmap_and_uvs_roundtrip(merged, expected_cmap, expected_uvs)
+    assert [t.format for t in merged["cmap"].tables] == [14] + expected_formats
+
+    # Confirm the boundary really is format 4's 16-bit length limit.
+    would_be = CmapSubtable.newSubtable(4)
+    would_be.platformID, would_be.platEncID, would_be.language = 3, 1, 0
+    would_be.cmap = expected_cmap
+    try:
+        length = len(would_be.compile(merged))
+    except (struct.error, OverflowError):
+        length = None
+    if expected_formats == [4]:
+        assert length == 65532
+    else:
+        assert length is None
+
+
+def test_merge_small_cmap_keeps_format4():
+    fonts = []
+    expected = {}
+    for gid, base in [(0x20, 0x800), (0x40, 0x1000)]:
+        font, cmap, uvs = _make_cmap_overflow_font(gid, base, 100)
+        fonts.append(font)
+        expected.update(cmap)
+    merged = _merge_and_recompile(fonts)
+    _assert_cmap_and_uvs_roundtrip(merged, expected, None, order=[4])
 
 
 def test_merge_head_different_units_per_em():
