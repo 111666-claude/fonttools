@@ -377,7 +377,17 @@ See: `OTSpec STAT Axis value table, format 4 <https://docs.microsoft.com/en-us/t
 
 .. rubric:: Attributes
 
--  ``name``: required, string. Name of the axis.
+-  ``name``: string. Name of the axis. Either ``name`` or ``tag`` is required.
+-  ``tag``: string. The four-character OpenType tag of the axis, matching the
+   ``tag`` attribute of a declared ``<axis>`` element. It is resolved to that
+   axis' ``name`` when the document is read, so a tag reference yields exactly
+   the same location as the equivalent name reference. This is useful because
+   axis names may be renamed while tags stay stable.
+
+When both ``name`` and ``tag`` are present they must identify the same declared
+axis; an unknown ``tag``, a tag shared by several ``<axis>`` elements, or a
+``name``/``tag`` mismatch raises a ``DesignSpaceDocumentError`` instead of
+silently using the axis default.
 
 Depending on whether you're representing a location in user or design coordinates,
 provide one of the attributes below.
@@ -504,8 +514,12 @@ glyphname pairs: the glyphs that need to be substituted. For a rule to be trigge
 
 .. rubric:: Attributes
 
--  ``name``: string, required. Must match one of the defined ``axis``
-   name attributes.
+-  ``name``: string. Must match one of the defined ``axis`` name attributes.
+   Either ``name`` or ``tag`` is required.
+-  ``tag``: string. The four-character tag of a declared axis; resolved to that
+   axis' ``name`` on read, exactly like the equivalent ``name`` condition. As
+   with the ``<dimension>`` element, an unknown/duplicate tag or a conflicting
+   ``name``/``tag`` pair raises an error.
 -  ``minimum``: number, required*. The low value, in design coordinates.
 -  ``maximum``: number, required*. The high value, in design coordinates.
 

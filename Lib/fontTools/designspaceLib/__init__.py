@@ -2031,6 +2031,8 @@ class BaseDocReader(LogMixin):
         self.sources = []
         self.instances = []
         self.axisDefaults = {}
+        # tag -> name for declared <axis> elements; detects duplicate tags.
+        self._axisTagToName = {}
         self._strictAxisNames = True
 
     @classmethod
@@ -2039,6 +2041,100 @@ class BaseDocReader(LogMixin):
         self = cls(f, documentObject)
         self.path = None
         return self
+
+    @staticmethod
+    def _elementLine(element):
+        """Return a `` (line N)`` suffix when the parser exposes line numbers."""
+        line = getattr(element, "sourceline", None)
+        return " (line %s)" % line if line is not None else ""
+
+    def _describeElement(self, element):
+        """Build a locatable description of a source/instance/... element."""
+        if element is None:
+            return ""
+        tag = element.tag
+        if not isinstance(tag, str):
+            tag = "element"
+        else:
+            tag = tag.rsplit("}", 1)[-1]
+        identifier = None
+        for attr in ("name", "filename", "source", "id"):
+            value = element.attrib.get(attr)
+            if value:
+                identifier = "%s=%r" % (attr, value)
+                break
+        description = "<%s%s>" % (
+            tag,
+            (" " + identifier) if identifier is not None else "",
+        )
+        description += self._elementLine(element)
+        return description
+
+    def _axisNameForTag(self, axisTag, context=""):
+        """Return the canonical axis name declared with ``axisTag``.
+
+        Raise :class:`DesignSpaceDocumentError` for an unknown or ambiguous
+        (duplicate) tag so that a tag reference can never silently fall back to
+        an unrelated/default axis.
+        """
+        matches = [a for a in self.documentObject.axes if a.tag == axisTag]
+        if not matches:
+            declared = ", ".join(
+                "%r (%s)" % (a.tag, a.name) for a in self.documentObject.axes if a.tag
+            )
+            prefix = ("%s: " % context) if context else ""
+            raise DesignSpaceDocumentError(
+                "%sunknown tag %r in axis reference: no declared <axis> has "
+                "this tag. Declared axis tags: %s."
+                % (prefix, axisTag, declared or "<none>")
+            )
+        if len(matches) > 1:
+            names = ", ".join(repr(a.name) for a in matches)
+            prefix = ("%s: " % context) if context else ""
+            raise DesignSpaceDocumentError(
+                "%sduplicate tag %r matches several declared axes (%s); tag "
+                "references are ambiguous." % (prefix, axisTag, names)
+            )
+        return matches[0].name
+
+    def _resolveAxisReference(self, axisName, axisTag, context=""):
+        """Resolve the ``name``/``tag`` pair of one axis reference.
+
+        Locations, conditions and mappings historically key their axes by
+        name. A ``tag`` reference is therefore resolved to the declared axis
+        name at parse time. When both attributes are present they must point
+        at the same declared axis, otherwise a locatable error is raised.
+        """
+        if axisTag is None:
+            # Name-only references keep their historical behaviour; callers
+            # decide how to handle an undeclared name.
+            return axisName
+        resolvedName = self._axisNameForTag(axisTag, context)
+        if axisName is not None:
+            nameAxis = self.documentObject.getAxis(axisName)
+            if nameAxis is None:
+                prefix = ("%s: " % context) if context else ""
+                raise DesignSpaceDocumentError(
+                    "%sname/tag conflict: name=%r does not identify a declared "
+                    "axis, while tag=%r identifies axis %r."
+                    % (prefix, axisName, axisTag, resolvedName)
+                )
+            if nameAxis.name != resolvedName:
+                prefix = ("%s: " % context) if context else ""
+                raise DesignSpaceDocumentError(
+                    "%sname/tag conflict: name=%r resolves to axis %r (tag %r) "
+                    "but tag=%r resolves to axis %r. Both attributes must "
+                    "reference the same declared axis."
+                    % (
+                        prefix,
+                        axisName,
+                        nameAxis.name,
+                        nameAxis.tag,
+                        axisTag,
+                        resolvedName,
+                    )
+                )
+        return resolvedName
 
     def read(self):
         self.readAxes()
@@ -2112,7 +2208,15 @@ class BaseDocReader(LogMixin):
             else:
                 # will allow these to be None, assume axis.maximum
                 cd["maximum"] = None
-            cd["name"] = conditionElement.attrib.get("name")
+            conditionContext = "<condition>%s in rule %s" % (
+                self._elementLine(conditionElement),
+                repr(ruleName) if ruleName is not None else "<unnamed>",
+            )
+            cd["name"] = self._resolveAxisReference(
+                conditionElement.attrib.get("name"),
+                conditionElement.attrib.get("tag"),
+                conditionContext,
+            )
             # # test for things
             if cd.get("minimum") is None and cd.get("maximum") is None:
                 raise DesignSpaceDocumentError(
@@ -2150,6 +2254,20 @@ class BaseDocReader(LogMixin):
             if axisElement.attrib.get("hidden", False):
                 axisObject.hidden = True
             axisObject.tag = axisElement.attrib.get("tag")
+            if axisObject.tag is not None:
+                if axisObject.tag in self._axisTagToName:
+                    raise DesignSpaceDocumentError(
+                        "duplicate tag %r on <axis name=%r>%s: tag is already "
+                        "declared for axis %r. Axis tags must be unique so that "
+                        "tag references are unambiguous."
+                        % (
+                            axisObject.tag,
+                            axisObject.name,
+                            self._elementLine(axisElement),
+                            self._axisTagToName[axisObject.tag],
+                        )
+                    )
+                self._axisTagToName[axisObject.tag] = axisObject.name
             for mapElement in axisElement.findall("map"):
                 a = float(mapElement.attrib["input"])
                 b = float(mapElement.attrib["output"])
@@ -2172,20 +2290,18 @@ class BaseDocReader(LogMixin):
         self.documentObject.axisMappings = []
         for mappingsElement in self.root.findall(".axes/mappings"):
             groupDescription = mappingsElement.attrib.get("description")
-            for mappingElement in mappingsElement.findall("mapping"):
+            for mappingIndex, mappingElement in enumerate(
+                mappingsElement.findall("mapping"), start=1
+            ):
                 description = mappingElement.attrib.get("description")
                 inputElement = mappingElement.find("input")
                 outputElement = mappingElement.find("output")
-                inputLoc = {}
-                outputLoc = {}
-                for dimElement in inputElement.findall(".dimension"):
-                    name = dimElement.attrib["name"]
-                    value = float(dimElement.attrib["xvalue"])
-                    inputLoc[name] = value
-                for dimElement in outputElement.findall(".dimension"):
-                    name = dimElement.attrib["name"]
-                    value = float(dimElement.attrib["xvalue"])
-                    outputLoc[name] = value
+                inputLoc = self._readMappingDimensions(
+                    inputElement, "input", mappingIndex
+                )
+                outputLoc = self._readMappingDimensions(
+                    outputElement, "output", mappingIndex
+                )
                 axisMappingObject = self.axisMappingDescriptorClass(
                     inputLocation=inputLoc,
                     outputLocation=outputLoc,
@@ -2193,6 +2309,34 @@ class BaseDocReader(LogMixin):
                     groupDescription=groupDescription,
                 )
                 self.documentObject.axisMappings.append(axisMappingObject)
+
+    def _readMappingDimensions(self, containerElement, direction, mappingIndex):
+        """Read the ``<dimension>`` entries of a mapping input/output."""
+        location = {}
+        if containerElement is None:
+            return location
+        for dimElement in containerElement.findall(".dimension"):
+            context = "<dimension>%s in <%s> of <mapping> #%d" % (
+                self._elementLine(dimElement),
+                direction,
+                mappingIndex,
+            )
+            name = self._resolveAxisReference(
+                dimElement.attrib.get("name"),
+                dimElement.attrib.get("tag"),
+                context,
+            )
+            if name is None:
+                raise DesignSpaceDocumentError(
+                    "%s: dimension requires a name= or tag= attribute." % context
+                )
+            if name in location:
+                raise DesignSpaceDocumentError(
+                    "%s: duplicate tag or axis reference: axis %r is given "
+                    "more than once per mapping %s." % (context, name, direction)
+                )
+            location[name] = float(dimElement.attrib["xvalue"])
+        return location
 
     def readAxisLabel(self, element: ET.Element):
         xml_attrs = {
@@ -2443,19 +2587,23 @@ class BaseDocReader(LogMixin):
                     sourceObject.muteKerning = True
             self.documentObject.sources.append(sourceObject)
 
-    def locationFromElement(self, element):
+    def locationFromElement(self, element, context=None):
         """Read a nested ``<location>`` element inside the given ``element``.
 
         .. versionchanged:: 5.0
            Return a tuple of (designLocation, userLocation)
+
+        ``context`` is an optional location label used in tag-reference errors.
         """
         elementLocation = (None, None)
+        if context is None and element is not None:
+            context = self._describeElement(element)
         for locationElement in element.findall(".location"):
-            elementLocation = self.readLocationElement(locationElement)
+            elementLocation = self.readLocationElement(locationElement, context=context)
             break
         return elementLocation
 
-    def readLocationElement(self, locationElement):
+    def readLocationElement(self, locationElement, context=None):
         """Read a ``<location>`` element.
 
         .. versionchanged:: 5.0
@@ -2465,12 +2613,31 @@ class BaseDocReader(LogMixin):
             raise DesignSpaceDocumentError("No axes defined")
         userLoc = {}
         designLoc = {}
+        seenAxes = set()
         for dimensionElement in locationElement.findall(".dimension"):
-            dimName = dimensionElement.attrib.get("name")
+            rawName = dimensionElement.attrib.get("name")
+            rawTag = dimensionElement.attrib.get("tag")
+            dimContext = "<dimension>%s%s" % (
+                self._elementLine(dimensionElement),
+                (" in " + context) if context else "",
+            )
+            if rawTag is not None:
+                # Tag references are always strict: an unknown/duplicate tag
+                # or a name/tag conflict must raise instead of being skipped
+                # and silently replaced by the axis default.
+                dimName = self._resolveAxisReference(rawName, rawTag, dimContext)
+            else:
+                dimName = rawName
             if self._strictAxisNames and dimName not in self.axisDefaults:
                 # In case the document contains no axis definitions,
                 self.log.warning('Location with undefined axis: "%s".', dimName)
                 continue
+            if dimName in seenAxes:
+                raise DesignSpaceDocumentError(
+                    "%s: duplicate tag or axis reference: axis %r is given "
+                    "more than once per location." % (dimContext, dimName)
+                )
+            seenAxes.add(dimName)
             userValue = xValue = yValue = None
             try:
                 userValue = dimensionElement.attrib.get("uservalue")
