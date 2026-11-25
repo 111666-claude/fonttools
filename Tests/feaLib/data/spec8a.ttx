@@ -41,17 +41,7 @@
             <FeatureIndex index="1" value="1"/>
             <FeatureIndex index="2" value="2"/>
           </DefaultLangSys>
-          <!-- LangSysCount=1 -->
-          <LangSysRecord index="0">
-            <LangSysTag value="TRK "/>
-            <LangSys>
-              <ReqFeatureIndex value="65535"/>
-              <!-- FeatureCount=3 -->
-              <FeatureIndex index="0" value="0"/>
-              <FeatureIndex index="1" value="1"/>
-              <FeatureIndex index="2" value="2"/>
-            </LangSys>
-          </LangSysRecord>
+          <!-- LangSysCount=0 -->
         </Script>
       </ScriptRecord>
     </ScriptList>

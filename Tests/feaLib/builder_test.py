@@ -23,6 +23,11 @@ import logging
 import unittest
 import warnings
 
+try:
+    import uharfbuzz as hb
+except ImportError:
+    hb = None
+
 
 def makeTTFont():
     glyphs = """
@@ -784,6 +789,326 @@ class BuilderTest(unittest.TestCase):
             multiple_languages["GSUB"].compile(multiple_languages),
             separate_languages["GSUB"].compile(separate_languages),
         )
+
+    def _script_langsys(self, font, table_tag, script_tag):
+        scripts = {
+            record.ScriptTag: record.Script
+            for record in font[table_tag].table.ScriptList.ScriptRecord
+        }
+        return scripts[script_tag]
+
+    def test_redundant_langsys_equivalent_to_default_is_omitted(self):
+        # A feature file that configures DFLT/dflt, latn/dflt and latn/TRK
+        # identically must not emit a separate TRK LangSysRecord: TRK falls
+        # back to the latn DefaultLangSys, which is equivalent.
+        font = self.build(dedent("""\
+            languagesystem DFLT dflt;
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature liga {
+                sub f i by f_i;
+                sub f l by f_l;
+            } liga;
+            feature kern {
+                pos A V -300;
+            } kern;
+        """))
+        for table_tag in ("GSUB", "GPOS"):
+            with self.subTest(table=table_tag):
+                script_tags = [
+                    record.ScriptTag
+                    for record in font[table_tag].table.ScriptList.ScriptRecord
+                ]
+                self.assertEqual(script_tags, ["DFLT", "latn"])
+                for script_tag in script_tags:
+                    script = self._script_langsys(font, table_tag, script_tag)
+                    self.assertIsNotNone(script.DefaultLangSys)
+                    self.assertEqual(script.LangSysRecord, [])
+                    self.assertEqual(script.LangSysCount, 0)
+
+    def test_langsys_with_different_feature_count_is_kept(self):
+        font = self.build(dedent("""\
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature liga {
+                sub f i by f_i;
+            } liga;
+            feature locl {
+                script latn;
+                language TRK exclude_dflt;
+                sub i by idotaccent;
+            } locl;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertIsNotNone(script.DefaultLangSys)
+        self.assertEqual(
+            [record.LangSysTag for record in script.LangSysRecord], ["TRK "]
+        )
+        trk = script.LangSysRecord[0].LangSys
+        self.assertNotEqual(trk.FeatureIndex, list(script.DefaultLangSys.FeatureIndex))
+        self.assertGreater(
+            len(trk.FeatureIndex), len(script.DefaultLangSys.FeatureIndex)
+        )
+
+    def test_langsys_with_same_count_different_feature_value_is_kept(self):
+        # Same number of features, but they point at distinct FeatureRecords
+        # (different lookups): the record is not provably equivalent.
+        font = self.build(dedent("""\
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature locl {
+                script latn;
+                language dflt;
+                sub A by A.alt1;
+                language TRK exclude_dflt;
+                sub A by A.alt2;
+            } locl;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertEqual(
+            [record.LangSysTag for record in script.LangSysRecord], ["TRK "]
+        )
+        default_fi = list(script.DefaultLangSys.FeatureIndex)
+        trk_fi = list(script.LangSysRecord[0].LangSys.FeatureIndex)
+        self.assertEqual(len(default_fi), len(trk_fi))
+        features = font["GSUB"].table.FeatureList.FeatureRecord
+        self.assertNotEqual(
+            [features[i] for i in trk_fi],
+            [features[i] for i in default_fi],
+        )
+
+    def test_langsys_without_default_is_kept(self):
+        # With no DefaultLangSys, shapers cannot fall back to a script
+        # default, so every language record must survive even though there is
+        # nothing to differ from.
+        font = self.build(dedent("""\
+            languagesystem latn TRK ;
+            feature locl {
+                script latn;
+                language TRK exclude_dflt;
+                sub i by idotaccent;
+            } locl;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertIsNone(script.DefaultLangSys)
+        self.assertEqual(
+            [record.LangSysTag for record in script.LangSysRecord], ["TRK "]
+        )
+
+    def test_langsys_with_equivalent_required_feature_is_omitted(self):
+        font = self.build(dedent("""\
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature rlig {
+                sub f f i by f_f_i;
+                script latn;
+                language dflt required;
+                language TRK required;
+            } rlig;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertNotEqual(script.DefaultLangSys.ReqFeatureIndex, 0xFFFF)
+        self.assertEqual(script.DefaultLangSys.FeatureIndex, [])
+        self.assertEqual(script.LangSysRecord, [])
+        self.assertEqual(script.LangSysCount, 0)
+
+    def test_langsys_with_mismatched_required_status_is_kept(self):
+        font = self.build(dedent("""\
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature rlig {
+                sub f f i by f_f_i;
+                script latn;
+                language dflt required;
+            } rlig;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertNotEqual(script.DefaultLangSys.ReqFeatureIndex, 0xFFFF)
+        (record,) = script.LangSysRecord
+        self.assertEqual(record.LangSysTag, "TRK ")
+        self.assertEqual(record.LangSys.ReqFeatureIndex, 0xFFFF)
+
+    def test_langsys_with_different_required_feature_is_kept(self):
+        font = self.build(dedent("""\
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature rlig {
+                sub f f i by f_f_i;
+                script latn;
+                language dflt required;
+            } rlig;
+            feature clig {
+                sub c h by c_h;
+                script latn;
+                language TRK required;
+            } clig;
+        """))
+        script = self._script_langsys(font, "GSUB", "latn")
+        self.assertEqual(
+            [record.LangSysTag for record in script.LangSysRecord], ["TRK "]
+        )
+        features = font["GSUB"].table.FeatureList.FeatureRecord
+        default_req = script.DefaultLangSys.ReqFeatureIndex
+        trk_req = script.LangSysRecord[0].LangSys.ReqFeatureIndex
+        self.assertNotEqual(default_req, 0xFFFF)
+        self.assertNotEqual(trk_req, 0xFFFF)
+        self.assertNotEqual(features[default_req], features[trk_req])
+
+    def test_langsys_equivalence_predicate_is_order_sensitive(self):
+        from types import SimpleNamespace
+
+        equivalent = Builder.langsysIsEquivalent_
+
+        def langsys(req, feature_index):
+            return SimpleNamespace(
+                ReqFeatureIndex=req, FeatureIndex=list(feature_index)
+            )
+
+        features = ["feat0", "feat1", "feat2"]
+        default = langsys(0xFFFF, [0, 1, 2])
+        self.assertTrue(equivalent(langsys(0xFFFF, [0, 1, 2]), default, features))
+        # The ordered FeatureIndex must match position by position.
+        self.assertFalse(equivalent(langsys(0xFFFF, [2, 1, 0]), default, features))
+        self.assertFalse(equivalent(langsys(0xFFFF, [0, 1]), default, features))
+        # Required-feature presence must match.
+        self.assertFalse(equivalent(langsys(0, [1, 2]), default, features))
+        self.assertTrue(equivalent(langsys(0, [1]), langsys(0, [1]), features))
+        # Required features are compared by value, not raw index, matching
+        # the subsetter predicate.
+        equal_value_records = ["same", "same"]
+        self.assertTrue(equivalent(langsys(0, []), langsys(1, []), equal_value_records))
+        self.assertFalse(equivalent(langsys(0, []), langsys(1, []), ["this", "that"]))
+
+    def test_redundant_langsys_output_is_subsetter_fixed_point(self):
+        # The subsetter already prunes LangSys records equivalent to the
+        # default. feaLib should emit the already-pruned form, so running
+        # that pruning on freshly built tables is a no-op.
+        import fontTools.subset  # noqa: F401  (registers pruning methods)
+
+        font = self.build(dedent("""\
+            languagesystem DFLT dflt;
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature liga { sub f i by f_i; } liga;
+            feature kern { pos A V -300; } kern;
+        """))
+        for table_tag in ("GSUB", "GPOS"):
+            table = font[table_tag]
+            before = table.compile(font)
+            table.remove_redundant_langsys()
+            after = table.compile(font)
+            self.assertEqual(before, after, table_tag)
+
+    @unittest.skipIf(hb is None, "uharfbuzz is not installed")
+    def test_redundant_langsys_omission_preserves_shaping(self):
+        import copy
+        from io import BytesIO
+
+        from fontTools.ttLib.tables._g_l_y_f import Glyph
+        from fontTools.ttLib.tables import otTables
+
+        glyph_order = [
+            ".notdef",
+            "space",
+            "A",
+            "V",
+            "f",
+            "i",
+            "l",
+            "f_i",
+            "f_l",
+        ]
+        builder = FontBuilder(1000, isTTF=True)
+        builder.setupGlyphOrder(glyph_order)
+        builder.setupCharacterMap(
+            {
+                0x20: "space",
+                ord("A"): "A",
+                ord("V"): "V",
+                ord("f"): "f",
+                ord("i"): "i",
+                ord("l"): "l",
+            }
+        )
+        builder.setupGlyf({name: Glyph() for name in glyph_order})
+        builder.setupHorizontalMetrics({name: (600, 0) for name in glyph_order})
+        builder.setupHorizontalHeader(ascent=800, descent=-200)
+        builder.setupNameTable({"familyName": "LangsysDedup", "styleName": "Regular"})
+        builder.setupOS2()
+        builder.setupPost()
+        builder.setupMaxp()
+        font = builder.font
+        addOpenTypeFeaturesFromString(
+            font,
+            dedent("""\
+            languagesystem DFLT dflt;
+            languagesystem latn dflt;
+            languagesystem latn TRK ;
+            feature liga {
+                sub f i by f_i;
+                sub f l by f_l;
+            } liga;
+            feature kern {
+                pos A V -300;
+            } kern;
+        """),
+        )
+
+        latn = self._script_langsys(font, "GSUB", "latn")
+        self.assertEqual([r.LangSysTag for r in latn.LangSysRecord], [])
+
+        optimized = BytesIO()
+        font.save(optimized)
+
+        # Re-create the redundant explicit TRK record that older feaLib
+        # emitted, giving us a before/after control font in one test.
+        control_record = otTables.LangSysRecord()
+        control_record.LangSysTag = "TRK "
+        control_record.LangSys = copy.deepcopy(latn.DefaultLangSys)
+        latn.LangSysRecord.append(control_record)
+        latn.LangSysCount = 1
+        control = BytesIO()
+        font.save(control)
+
+        def shape(data):
+            face = hb.Face(data)
+            hb_font = hb.Font(face)
+            hb_font.scale = (face.upem, face.upem)
+            hb.ot_font_set_funcs(hb_font)
+            results = {}
+            for text in ("fil fl", "AV"):
+                for language in ("dflt", "TRK "):
+                    buf = hb.Buffer()
+                    buf.add_str(text)
+                    # Sets LTR direction; works across uharfbuzz versions
+                    # where assigning buf.direction directly may differ.
+                    buf.guess_segment_properties()
+                    buf.set_script_from_ot_tag("latn")
+                    buf.set_language_from_ot_tag(language)
+                    hb.shape(hb_font, buf, None)
+                    infos = buf.glyph_infos
+                    if callable(infos):  # uharfbuzz < 0.?. exposed methods
+                        infos = infos()
+                    positions = buf.glyph_positions
+                    if callable(positions):
+                        positions = positions()
+                    results[(text, language)] = (
+                        tuple(info.codepoint for info in infos),
+                        tuple(pos.x_advance for pos in positions),
+                    )
+            return results
+
+        optimized_shape = shape(optimized.getvalue())
+        control_shape = shape(control.getvalue())
+        # Omitting the record must match the explicit-record control exactly,
+        # including TRK shaping through DefaultLangSys fallback.
+        self.assertEqual(optimized_shape, control_shape)
+        for text in ("fil fl", "AV"):
+            self.assertEqual(
+                optimized_shape[(text, "dflt")],
+                optimized_shape[(text, "TRK ")],
+                text,
+            )
 
     def test_language_in_aalt_feature(self):
         self.assertRaisesRegex(

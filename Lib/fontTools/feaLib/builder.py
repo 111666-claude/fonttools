@@ -994,12 +994,18 @@ class Builder(object):
                 required_feature_indices[(script, lang)] = feature_index
 
         # Build ScriptList.
+        feature_records = table.FeatureList.FeatureRecord
         for script, lang_features in sorted(scripts.items()):
             srec = otTables.ScriptRecord()
             srec.ScriptTag = script
             srec.Script = otTables.Script()
             srec.Script.DefaultLangSys = None
             srec.Script.LangSysRecord = []
+
+            # Build every LangSys first: "dflt" sorts after some language
+            # tags (uppercase tags sort before lowercase "dflt"), so the
+            # script's default is not necessarily built first.
+            langsys_records = []
             for lang, feature_indices in sorted(lang_features.items()):
                 langrec = otTables.LangSysRecord()
                 langrec.LangSys = otTables.LangSys()
@@ -1015,12 +1021,31 @@ class Builder(object):
                     i for i in feature_indices if i != req_feature_index
                 ]
                 langrec.LangSys.FeatureCount = len(langrec.LangSys.FeatureIndex)
+                langsys_records.append((lang, langrec))
 
+            default_langsys = next(
+                (
+                    langrec.LangSys
+                    for lang, langrec in langsys_records
+                    if lang == "dflt"
+                ),
+                None,
+            )
+            for lang, langrec in langsys_records:
                 if lang == "dflt":
                     srec.Script.DefaultLangSys = langrec.LangSys
-                else:
-                    langrec.LangSysTag = lang
-                    srec.Script.LangSysRecord.append(langrec)
+                    continue
+                if default_langsys is not None and self.langsysIsEquivalent_(
+                    langrec.LangSys, default_langsys, feature_records
+                ):
+                    # The language enables the exact same required feature
+                    # and ordered feature list as the script's default.
+                    # Shapers fall back to the default LangSys when the
+                    # language tag is absent, so the record is redundant;
+                    # omitting it matches what the subsetter prunes later.
+                    continue
+                langrec.LangSysTag = lang
+                srec.Script.LangSysRecord.append(langrec)
             srec.Script.LangSysCount = len(srec.Script.LangSysRecord)
             table.ScriptList.ScriptRecord.append(srec)
 
@@ -1028,6 +1053,36 @@ class Builder(object):
         table.FeatureList.FeatureCount = len(table.FeatureList.FeatureRecord)
         table.LookupList.LookupCount = len(table.LookupList.Lookup)
         return table
+
+    @staticmethod
+    def langsysIsEquivalent_(langsys, default_langsys, feature_records):
+        """Return True if ``langsys`` is redundant vs the script default.
+
+        Two LangSys are equivalent when they have the same required-feature
+        status/feature and the same ordered feature list, compared by feature
+        value rather than raw FeatureList index. This mirrors the subsetter's
+        ``GSUB/GPOS.remove_redundant_langsys`` predicate: an absent language
+        record makes shapers use the script's DefaultLangSys, so a record
+        equivalent to it can be omitted without changing shaping.
+        """
+        if len(langsys.FeatureIndex) != len(default_langsys.FeatureIndex):
+            return False
+
+        req_feature = langsys.ReqFeatureIndex
+        default_req_feature = default_langsys.ReqFeatureIndex
+        if (req_feature == 0xFFFF) != (default_req_feature == 0xFFFF):
+            return False
+        if req_feature != 0xFFFF and (
+            feature_records[req_feature] != feature_records[default_req_feature]
+        ):
+            return False
+
+        for feature_index, default_feature_index in zip(
+            langsys.FeatureIndex, default_langsys.FeatureIndex
+        ):
+            if feature_records[feature_index] != feature_records[default_feature_index]:
+                return False
+        return True
 
     def promoteLayoutTable_(self, table):
         if not self.font.hasExtendedGlyphIDs():

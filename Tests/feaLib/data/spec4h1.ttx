@@ -38,22 +38,13 @@
             <FeatureIndex index="0" value="1"/>
             <FeatureIndex index="1" value="3"/>
           </DefaultLangSys>
-          <!-- LangSysCount=2 -->
+          <!-- LangSysCount=1 -->
           <LangSysRecord index="0">
             <LangSysTag value="DEU "/>
             <LangSys>
               <ReqFeatureIndex value="65535"/>
               <!-- FeatureCount=2 -->
               <FeatureIndex index="0" value="0"/>
-              <FeatureIndex index="1" value="3"/>
-            </LangSys>
-          </LangSysRecord>
-          <LangSysRecord index="1">
-            <LangSysTag value="TRK "/>
-            <LangSys>
-              <ReqFeatureIndex value="65535"/>
-              <!-- FeatureCount=2 -->
-              <FeatureIndex index="0" value="1"/>
               <FeatureIndex index="1" value="3"/>
             </LangSys>
           </LangSysRecord>
