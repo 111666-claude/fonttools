@@ -132,8 +132,6 @@ Examples::
 
     $ fonttools subset --glyph-names?
     Current setting for 'glyph-names' is: False
-    $ fonttools subset --name-IDs=?
-    Current setting for 'name-IDs' is: [0, 1, 2, 3, 4, 5, 6]
     $ fonttools subset --hinting? --no-hinting --hinting?
     Current setting for 'hinting' is: True
     Current setting for 'hinting' is: False
@@ -339,17 +337,21 @@ codes, see: http://www.microsoft.com/typography/otspec/name.htm
 
 --name-IDs[+|-]=<nameID>[,<nameID>...]
   Specify (=), add to (+=) or exclude from (-=) the set of 'name' table
-  entry nameIDs that will be preserved. By default, only nameIDs between 0
-  and 6 are preserved, the rest are dropped. Use '*' to keep all entries.
+  entry nameIDs that will be preserved. By default, all standard nameIDs
+  (0-255) are preserved; use '*' to select all standard IDs. nameIDs >=256
+  that are referenced elsewhere in the font (e.g. by 'fvar' or 'STAT') are
+  also preserved and cannot be dropped with this option.
 
   Examples:
 
   --name-IDs+=7,8,9
       * Also keep Trademark, Manufacturer and Designer name entries.
+  --name-IDs-=7
+      * Drop the Trademark name entry (unless another table references it).
   --name-IDs=
-      * Drop all 'name' table entries.
+      * Drop all unreferenced 'name' table entries.
   --name-IDs=*
-      * keep all 'name' table entries
+      * Keep all standard nameID entries (0-255).
 
 --name-legacy
   Keep legacy (non-Unicode) 'name' table entries (0.x, 1.x etc.).
@@ -3186,22 +3188,83 @@ def prune_pre_subset(self, font, options):
 NAME_IDS_TO_OBFUSCATE = {1, 2, 3, 4, 6, 16, 17, 18}
 
 
+def _name_record_rank(record):
+    # Prefer Unicode (Windows-platform) records, then English, then a stable
+    # platform/encoding/language order so rescue choices are deterministic.
+    return (
+        not record.isUnicode(),
+        record.langID != 0x0409,
+        record.platformID != 3,
+        record.platformID,
+        record.platEncID,
+        record.langID,
+    )
+
+
+def _rescue_name_records(names, missingIDs, pool):
+    """Append one best pool record for each nameID in missingIDs.
+
+    Records already present in ``names`` are never duplicated. Name IDs that
+    have no record in ``pool`` are left untouched (the source font did not
+    contain them).
+    """
+    if not missingIDs:
+        return
+    best = {}
+    for record in pool:
+        nameID = record.nameID
+        if nameID not in missingIDs:
+            continue
+        previous = best.get(nameID)
+        if previous is None or _name_record_rank(record) < _name_record_rank(previous):
+            best[nameID] = record
+    names.extend(best[nameID] for nameID in sorted(best))
+
+
 @_add_method(ttLib.getTableClass("name"))
 def prune_post_subset(self, font, options):
     visitor = NameRecordVisitor()
     visitor.visit(font)
+    # Apply the nameID filter first.
     nameIDs = set(options.name_IDs) | visitor.seen
     if "*" in options.name_IDs:
         nameIDs |= {n.nameID for n in self.names if n.nameID < 256}
-    self.names = [n for n in self.names if n.nameID in nameIDs]
+    # Keep the ID-filtered records aside so names can be rescued from the
+    # legacy/language filters below.
+    idFilteredRecords = [n for n in self.names if n.nameID in nameIDs]
+    self.names = idFilteredRecords
+
     if not options.name_legacy:
         # TODO(behdad) Sometimes (eg Apple Color Emoji) there's only a macroman
         # entry for Latin and no Unicode names.
         self.names = [n for n in self.names if n.isUnicode()]
+    unicodeRecords = self.names
+
     # TODO(behdad) Option to keep only one platform's
-    if "*" not in options.name_languages:
+    languageFilterActive = "*" not in options.name_languages
+    if languageFilterActive:
         # TODO(behdad) This is Windows-platform specific!
         self.names = [n for n in self.names if n.langID in options.name_languages]
+
+        # The language filter must not remove a standard name ID completely
+        # (apps would then show an empty family/style/... name): when every
+        # record of an ID was filtered out, fall back to the best Unicode
+        # record available in another language.
+        missingIDs = {n.nameID for n in unicodeRecords}.difference(
+            n.nameID for n in self.names
+        )
+        _rescue_name_records(self.names, missingIDs, unicodeRecords)
+
+    if visitor.seen:
+        # 'fvar', 'STAT', 'CPAL' and layout feature parameter tables refer to
+        # name IDs. Never let subsetting create a dangling reference: rescue a
+        # record for every referenced ID that is still missing. The pool also
+        # includes legacy records, since a dangling reference is worse than
+        # keeping one legacy record. Duplicate platform/language records never
+        # produce duplicate rescued entries.
+        missingIDs = visitor.seen.difference(n.nameID for n in self.names)
+        _rescue_name_records(self.names, missingIDs, idFilteredRecords)
+
     if options.obfuscate_names:
         namerecs = []
         # Preserve names to be scrambled or dropped elsewhere so that other
@@ -3425,15 +3488,7 @@ class Options(object):
         self.glyph_names = False
         self.legacy_cmap = False
         self.symbol_cmap = False
-        self.name_IDs = [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-        ]  # https://github.com/fonttools/fonttools/issues/1170#issuecomment-364631225
+        self.name_IDs = list(range(256))
         self.name_legacy = False
         self.name_languages = [0x0409]  # English
         self.obfuscate_names = False  # to make webfont unusable as a system font
