@@ -8,6 +8,22 @@ from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables import otTables as ot
+from fontTools.ttLib.tables._g_l_y_f import Glyph
+from fontTools.ttLib.tables.BitmapGlyphMetrics import (
+    BigGlyphMetrics,
+    SmallGlyphMetrics,
+)
+from fontTools.ttLib.tables.E_B_D_T_ import (
+    EbdtComponent,
+    ebdt_bitmap_format_1,
+    ebdt_bitmap_format_8,
+    ebdt_bitmap_format_9,
+)
+from fontTools.ttLib.tables.E_B_L_C_ import (
+    SbitLineMetrics,
+    Strike,
+    eblc_index_sub_table_1,
+)
 from fontTools.misc.loggingTools import CapturingLogHandler
 from fontTools.subset.svg import etree
 import difflib
@@ -456,6 +472,490 @@ class SubsetTest:
         subsetfont = TTFont(subsetpath)
         assert "x" in subsetfont["CBDT"].strikeData[0]
         assert "y" in subsetfont["CBDT"].strikeData[0]
+
+    # Helpers for EBDT/CBDT composite glyph subsetting tests.
+
+    @staticmethod
+    def _bitmap_metrics(height, width):
+        metrics = SmallGlyphMetrics()
+        metrics.height = height
+        metrics.width = width
+        metrics.BearingX = 0
+        metrics.BearingY = height
+        metrics.Advance = width
+        return metrics
+
+    @staticmethod
+    def _big_bitmap_metrics(height, width):
+        metrics = BigGlyphMetrics()
+        metrics.height = height
+        metrics.width = width
+        metrics.horiBearingX = 0
+        metrics.horiBearingY = height
+        metrics.horiAdvance = width
+        metrics.vertBearingX = 0
+        metrics.vertBearingY = 0
+        metrics.vertAdvance = height
+        return metrics
+
+    def _make_ebdt_font(self, strikes, glyph_names=None):
+        """Build a TTF with an EBDT/EBLC table from a compact description.
+
+        Each entry in ``strikes`` describes one strike, mapping a glyph name
+        to either ``("bitmap", height, width, data)``, ``("empty", h, w)`` or
+        ``("comp8"/"comp9", [(componentName, x, y), ...])``.
+        """
+        glyph_order = glyph_names or (
+            [".notdef"] + [chr(c) for c in range(ord("a"), ord("l") + 1)]
+        )
+        fb = FontBuilder(1000, isTTF=True)
+        fb.setupGlyphOrder(glyph_order)
+        fb.setupCharacterMap({ord(g): g for g in glyph_order[1:]})
+        fb.setupGlyf({g: Glyph() for g in glyph_order})
+        fb.setupHorizontalMetrics({g: (500, 0) for g in glyph_order})
+        fb.setupHorizontalHeader(ascent=800, descent=-200)
+        fb.setupNameTable(
+            {
+                "familyName": "EBDTTest",
+                "styleName": "Regular",
+                "uniqueFontIdentifier": "EBDTTest",
+                "fullName": "EBDTTest",
+                "psName": "EBDTTest",
+            }
+        )
+        fb.setupOS2()
+        fb.setupPost()
+        font = fb.font
+
+        ebdt = newTable("EBDT")
+        ebdt.version = 2.0
+        ebdt.strikeData = []
+        eblc = newTable("EBLC")
+        eblc.version = 2.0
+        eblc.strikes = []
+
+        for strike_spec in strikes:
+            strike = {}
+            for name, entry in strike_spec.items():
+                kind = entry[0]
+                if kind == "bitmap":
+                    _, height, width, data = entry
+                    glyph = ebdt_bitmap_format_1(None, font)
+                    glyph.metrics = self._bitmap_metrics(height, width)
+                    glyph.imageData = data
+                elif kind == "empty":
+                    _, height, width = entry
+                    glyph = ebdt_bitmap_format_1(None, font)
+                    glyph.metrics = self._bitmap_metrics(height, width)
+                    glyph.imageData = b""
+                elif kind in ("comp8", "comp9"):
+                    cls = {
+                        "comp8": ebdt_bitmap_format_8,
+                        "comp9": ebdt_bitmap_format_9,
+                    }[kind]
+                    glyph = cls(None, font)
+                    glyph.metrics = (
+                        self._bitmap_metrics(10, 10)
+                        if kind == "comp8"
+                        else self._big_bitmap_metrics(10, 10)
+                    )
+                    glyph.componentArray = []
+                    for comp_name, x_offset, y_offset in entry[1]:
+                        component = EbdtComponent()
+                        component.name = comp_name
+                        component.xOffset = x_offset
+                        component.yOffset = y_offset
+                        glyph.componentArray.append(component)
+                else:
+                    raise AssertionError("unknown bitmap kind %r" % (kind,))
+                strike[name] = glyph
+            ebdt.strikeData.append(strike)
+
+            cur_strike = Strike()
+            size_table = cur_strike.bitmapSizeTable
+            for direction in ("hori", "vert"):
+                line_metrics = SbitLineMetrics()
+                line_metrics.ascender = 10
+                line_metrics.descender = 0
+                line_metrics.widthMax = 10
+                line_metrics.caretSlopeNumerator = 0
+                line_metrics.caretSlopeDenominator = 0
+                line_metrics.caretOffset = 0
+                line_metrics.minOriginSB = 0
+                line_metrics.minAdvanceSB = 0
+                line_metrics.maxBeforeBL = 0
+                line_metrics.minAfterBL = 0
+                line_metrics.pad1 = 0
+                line_metrics.pad2 = 0
+                setattr(size_table, direction, line_metrics)
+            size_table.colorRef = 0
+            size_table.ppemX = 16
+            size_table.ppemY = 16
+            size_table.bitDepth = 1
+            size_table.flags = 1
+
+            # One index subtable per image format, mirroring real fonts.
+            groups = {}
+            for name, entry in strike_spec.items():
+                groups.setdefault(entry[0], []).append(name)
+            for kind, names in groups.items():
+                image_format = {
+                    "bitmap": 1,
+                    "empty": 1,
+                    "comp8": 8,
+                    "comp9": 9,
+                }[kind]
+                index_sub_table = eblc_index_sub_table_1(None, font)
+                index_sub_table.indexFormat = 1
+                index_sub_table.imageFormat = image_format
+                index_sub_table.names = names
+                index_sub_table.locations = []
+                cur_strike.indexSubTables.append(index_sub_table)
+            eblc.strikes.append(cur_strike)
+
+        font["EBDT"] = ebdt
+        font["EBLC"] = eblc
+        return font
+
+    def _subset_ebdt_font(self, strikes, gids=None, glyphs=None, **options_kwargs):
+        fontpath = self.temp_path(".ttf")
+        subsetpath = self.temp_path(".ttf")
+        self._make_ebdt_font(strikes).save(fontpath)
+        # EBDT/EBLC are dropped by default; keep them for these tests.
+        options = subset.Options()
+        options.drop_tables = [
+            t for t in options.drop_tables if t not in ("EBDT", "EBLC")
+        ]
+        options.glyph_names = True
+        for name, value in options_kwargs.items():
+            setattr(options, name, value)
+        subsetter = subset.Subsetter(options)
+        font = TTFont(fontpath)
+        subsetter.populate(gids=gids or [], glyphs=glyphs or [])
+        subsetter.subset(font)
+        retained_order = font.getGlyphOrder()
+        font.save(subsetpath)
+        # Re-open from disk, so the assertions cover the compiled and
+        # re-decompiled bitmap data, not the in-memory objects.
+        return retained_order, TTFont(subsetpath)
+
+    @staticmethod
+    def _bitmap_composites(font):
+        """Return {strike_index: {composite_gid: [component gids]}}."""
+        composites = {}
+        for strike_index, strike in enumerate(font["EBDT"].strikeData):
+            per_strike = {}
+            for glyph_name, glyph in strike.items():
+                glyph.ensureDecompiled()
+                component_array = getattr(glyph, "componentArray", None)
+                if component_array is not None:
+                    per_strike[font.getGlyphID(glyph_name)] = [
+                        font.getGlyphID(component.name) for component in component_array
+                    ]
+            composites[strike_index] = per_strike
+        return composites
+
+    def _assert_ebdt_consistent(self, font):
+        """Every reference in the saved font must point at a retained glyph."""
+        reverse_map = font.getReverseGlyphMap()
+        composites = self._bitmap_composites(font)
+        for strike_index, per_strike in composites.items():
+            for glyph_gid, component_gids in per_strike.items():
+                glyph_name = font.getGlyphName(glyph_gid)
+                for component_gid in component_gids:
+                    component_name = font.getGlyphName(component_gid)
+                    assert reverse_map[component_name] == component_gid
+                    # A composite must not reference a glyph that has no data
+                    # and therefore cannot be rendered.
+                    assert (
+                        component_name in font["EBDT"].strikeData[strike_index]
+                    ), "strike %d: glyph %r references missing component %r" % (
+                        strike_index,
+                        glyph_name,
+                        component_name,
+                    )
+        # The locator must agree with the data table about which glyphs exist.
+        for strike_index, strike in enumerate(font["EBDT"].strikeData):
+            locator_names = {
+                name
+                for index_sub_table in font["EBLC"].strikes[strike_index].indexSubTables
+                for name in index_sub_table.names
+            }
+            assert locator_names == set(strike)
+        return composites
+
+    def test_ebdt_composite_components_kept_and_remapped(self):
+        # Components are already requested; their references must follow the
+        # new glyph order.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\xf0\xf0"),
+                "l": ("bitmap", 2, 8, b"\xaa\xaa"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0), ("l", 2, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(
+            strikes, gids=[0, 1, 3, 6, 12]
+        )
+        assert retained_order == [".notdef", "a", "c", "f", "l"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {3: [1, 2, 4]}}
+
+    def test_ebdt_composite_components_closed_over(self):
+        # Components are not requested; the subsetter retains them (and their
+        # bitmaps) and remaps the references.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\xf0\xf0"),
+                "l": ("bitmap", 2, 8, b"\xaa\xaa"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0), ("l", 2, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(
+            strikes, gids=[0, 3, 6, 9, 12]
+        )
+        assert retained_order == [".notdef", "a", "c", "f", "i", "l"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {3: [1, 2, 5]}}
+
+    def test_ebdt_composite_nested_components(self):
+        # f -> a, c and c -> d, e: the closure must be transitive.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "b": ("bitmap", 2, 8, b"\x11\x11"),
+                "d": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "e": ("bitmap", 2, 8, b"\x33\x33"),
+                "c": ("comp8", [("d", 3, 0), ("e", 4, 0)]),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "d", "e", "f"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {5: [1, 2], 2: [3, 4]}}
+
+    def test_ebdt_composite_shared_components(self):
+        # Two composites share component `a`.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "d": ("bitmap", 2, 8, b"\x33\x33"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+                "g": ("comp8", [("a", 0, 0), ("d", 2, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6, 7])
+        assert retained_order == [".notdef", "a", "c", "d", "f", "g"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {4: [1, 2], 5: [1, 3]}}
+
+    def test_ebdt_composite_multiple_strikes(self):
+        # The composite has different components in each strike; only strike 0
+        # references `c`, which must still be retained for the whole font.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+            },
+            {
+                "a": ("bitmap", 4, 8, b"\x0f"),
+                "f": ("comp8", [("a", 0, 0)]),
+            },
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "f"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {3: [1, 2]}, 1: {3: [1]}}
+
+    def test_ebdt_composite_empty_component_bitmap(self):
+        # An empty (zero-byte) bitmap is still a valid component.
+        strikes = [
+            {
+                "a": ("empty", 2, 8),
+                "c": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "f"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {3: [1, 2]}}
+
+    def test_ebdt_composite_component_without_bitmap(self):
+        # A component may have an outline but no bitmap in the strike; it must
+        # still be retained and referenced, not dropped.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "f"]
+        composites = self._bitmap_composites(subsetfont)
+        assert composites == {0: {3: [1, 2]}}
+
+    def test_ebdt_composite_format_9(self):
+        # Format 9 uses big metrics but the same component array semantics.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "f": ("comp9", [("a", 0, 0), ("c", 1, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "f"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {3: [1, 2]}}
+
+    def test_ebdt_composite_retain_gids(self):
+        # With --retain-gids the original glyph ids must be preserved, and the
+        # component references must use them.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\xf0\xf0"),
+                "l": ("bitmap", 2, 8, b"\xaa\xaa"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0), ("l", 2, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(
+            strikes, gids=[0, 3, 6, 9, 12], retain_gids=True
+        )
+        # Retaining gids keeps the whole original order up to the last
+        # retained glyph, with the dropped glyphs emptied.
+        assert len(retained_order) == 13
+        assert subsetfont.getGlyphOrder() == retained_order
+        composites = self._assert_ebdt_consistent(subsetfont)
+        expected = [subsetfont.getGlyphID(name) for name in ("a", "c", "l")]
+        assert composites == {0: {6: expected}}
+        assert expected == [1, 3, 12]
+
+    def test_ebdt_composite_unknown_component_dropped(self):
+        # A component that does not exist in the font cannot be encoded in the
+        # subset; the reference must be dropped rather than left dangling.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "f": ("comp8", [("a", 0, 0), ("glyph00300", 1, 0)]),
+            }
+        ]
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "f"]
+        composites = self._assert_ebdt_consistent(subsetfont)
+        assert composites == {0: {2: [1]}}
+
+    def test_ebdt_composite_data_metrics_and_bounds_preserved(self):
+        # The component bitmaps, their metrics and the composite's effective
+        # rendering bounds must survive subsetting and a save/reopen cycle.
+        strikes = [
+            {
+                "a": ("bitmap", 3, 5, b"\x12\x34"),
+                "c": ("bitmap", 4, 6, b"\x56\x78"),
+                "l": ("bitmap", 7, 2, b"\x9a\xbc"),
+                "f": (
+                    "comp8",
+                    [("a", -1, 2), ("c", 3, 4), ("l", 5, -6)],
+                ),
+            }
+        ]
+
+        def render_signature(font, glyph_name):
+            glyph = font["EBDT"].strikeData[0][glyph_name]
+            glyph.ensureDecompiled()
+            components = []
+            bounds = []
+            for component in glyph.componentArray:
+                bitmap = font["EBDT"].strikeData[0][component.name]
+                bitmap.ensureDecompiled()
+                metrics = bitmap.metrics
+                components.append(
+                    (
+                        font.getGlyphID(component.name),
+                        component.xOffset,
+                        component.yOffset,
+                        metrics.height,
+                        metrics.width,
+                        metrics.BearingX,
+                        metrics.BearingY,
+                        metrics.Advance,
+                        bytes(bitmap.imageData),
+                    )
+                )
+                bounds.append(
+                    (
+                        component.xOffset + metrics.BearingX,
+                        component.yOffset + metrics.BearingY - metrics.height,
+                        component.xOffset + metrics.BearingX + metrics.Advance,
+                        component.yOffset + metrics.BearingY,
+                    )
+                )
+            return components, bounds
+
+        fontpath = self.temp_path(".ttf")
+        font = self._make_ebdt_font(strikes)
+        font.save(fontpath)
+        orig_components, orig_bounds = render_signature(TTFont(fontpath), "f")
+        assert orig_bounds == [(-1, 2, 4, 5), (3, 4, 9, 8), (5, -6, 7, 1)]
+
+        retained_order, subsetfont = self._subset_ebdt_font(strikes, gids=[0, 6])
+        assert retained_order == [".notdef", "a", "c", "f", "l"]
+        components, bounds = render_signature(subsetfont, "f")
+        # Same data, metrics and placement, only the glyph ids are remapped.
+        assert components == [
+            (1, *orig_components[0][1:]),
+            (2, *orig_components[1][1:]),
+            (4, *orig_components[2][1:]),
+        ]
+        assert bounds == orig_bounds
+        # The locator metrics for the bitmap index subtables are unchanged.
+        assert [
+            index_sub_table.imageFormat
+            for index_sub_table in subsetfont["EBLC"].strikes[0].indexSubTables
+        ] == [1, 8]
+
+    def test_ebdt_composite_cbdt_variant(self):
+        # CBDT/CBLC inherit the same code path from EBDT/EBLC.
+        strikes = [
+            {
+                "a": ("bitmap", 2, 8, b"\xff\xff"),
+                "c": ("bitmap", 2, 8, b"\x0f\x0f"),
+                "f": ("comp8", [("a", 0, 0), ("c", 1, 0)]),
+            }
+        ]
+        fontpath = self.temp_path(".ttf")
+        subsetpath = self.temp_path(".ttf")
+        font = self._make_ebdt_font(strikes)
+        ebdt, eblc = font["EBDT"], font["EBLC"]
+        del font["EBDT"], font["EBLC"]
+        cbdt = newTable("CBDT")
+        cbdt.version = ebdt.version
+        cbdt.strikeData = ebdt.strikeData
+        cblc = newTable("CBLC")
+        cblc.version = eblc.version
+        cblc.strikes = eblc.strikes
+        font["CBDT"] = cbdt
+        font["CBLC"] = cblc
+        font.save(fontpath)
+
+        options = subset.Options()
+        options.glyph_names = True
+        subsetter = subset.Subsetter(options)
+        font = TTFont(fontpath)
+        subsetter.populate(gids=[0, 6])
+        subsetter.subset(font)
+        font.save(subsetpath)
+        subsetfont = TTFont(subsetpath)
+        assert subsetfont.getGlyphOrder() == [".notdef", "a", "c", "f"]
+        glyph = subsetfont["CBDT"].strikeData[0]["f"]
+        glyph.ensureDecompiled()
+        assert [component.glyphCode for component in glyph.componentArray] == [1, 2]
 
     def test_sbix(self):
         fontpath = self.compile_font(self.getpath("sbix.ttx"), ".ttf")

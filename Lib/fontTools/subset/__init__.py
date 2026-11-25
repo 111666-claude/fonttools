@@ -1930,12 +1930,72 @@ def subset_glyphs(self, s):
     return True
 
 
+def _decompileBitmapGlyph(glyph):
+    """Decompile a lazily-loaded bitmap glyph, if it still needs it.
+
+    A bitmap glyph built in memory (e.g. from XML) has no raw data to
+    decompile and already exposes its attributes; only glyphs loaded
+    lazily from a font still carry ``data``.
+    """
+    if glyph.__dict__.get("data") is not None:
+        glyph.ensureDecompiled()
+
+
+# CBDT will inherit it
+@_add_method(ttLib.getTableClass("EBDT"))
+def closure_glyphs(self, s):
+    from fontTools.ttLib.tables.E_B_D_T_ import ComponentBitmapGlyph
+
+    # The composite bitmap formats (8 and 9) reference other glyphs by glyph
+    # ID, so close over their components like other composite glyphs.
+    decompose = s.glyphs
+    while decompose:
+        components = set()
+        for g in decompose:
+            for strike in self.strikeData:
+                if g not in strike:
+                    continue
+                glyph = strike[g]
+                if not isinstance(glyph, ComponentBitmapGlyph):
+                    continue
+                # Decompile now, while the font still has its original glyph
+                # order, so that the component glyph codes are resolved to the
+                # correct glyph names. Decompiling lazily at save time, after
+                # the glyph order has been remapped, would name the components
+                # after the wrong glyphs.
+                _decompileBitmapGlyph(glyph)
+                components.update(
+                    c.name for c in glyph.__dict__.get("componentArray", ())
+                )
+        components -= s.glyphs
+        s.glyphs.update(components)
+        decompose = components
+
+
 # CBDT will inherit it
 @_add_method(ttLib.getTableClass("EBDT"))
 def subset_glyphs(self, s):
+    from fontTools.ttLib.tables.E_B_D_T_ import ComponentBitmapGlyph
+
     strikeData = [
         {g: strike[g] for g in s.glyphs if g in strike} for strike in self.strikeData
     ]
+    for strike in strikeData:
+        for glyph in strike.values():
+            if not isinstance(glyph, ComponentBitmapGlyph):
+                continue
+            # The component references must be recompiled against the new
+            # glyph order, so make sure they are decompiled while the glyph
+            # names in the array still refer to the original glyph order.
+            _decompileBitmapGlyph(glyph)
+            # A component that is not retained cannot be addressed in the
+            # subset (it may not exist in the font at all); drop the
+            # reference rather than encode a stale glyph code.
+            glyph.componentArray = [
+                c
+                for c in glyph.__dict__.get("componentArray", ())
+                if c.name in s.glyphs
+            ]
     # Prune empty strikes
     # https://github.com/fonttools/fonttools/issues/1633
     self.strikeData = [strike for strike in strikeData if strike]
@@ -3717,6 +3777,29 @@ class Subsetter(object):
                 )
                 log.glyphs(self.glyphs, font=font)
         self.glyphs_glyfed = frozenset(self.glyphs)
+
+        # Bitmap composite glyphs (EBDT/CBDT formats 8 and 9) reference other
+        # glyphs by ID, so close over them like other composite glyphs, and
+        # before the glyf/CFF closures so that the components' own outlines
+        # are closed over too. 'bdat' is the Apple variant of 'EBDT'.
+        for table in ("EBDT", "CBDT", "bdat"):
+            if table in font:
+                with timer("close glyph list over '%s'" % table):
+                    log.info(
+                        "Closing glyph list over '%s': %d glyphs before",
+                        table,
+                        len(self.glyphs),
+                    )
+                    log.glyphs(self.glyphs, font=font)
+                    font[table].closure_glyphs(self)
+                    self.glyphs.intersection_update(realGlyphs)
+                    log.info(
+                        "Closed glyph list over '%s': %d glyphs after",
+                        table,
+                        len(self.glyphs),
+                    )
+                    log.glyphs(self.glyphs, font=font)
+        self.glyphs_ebdted = frozenset(self.glyphs)
 
         if "glyf" in font:
             with timer("close glyph list over 'glyf'"):
