@@ -50,6 +50,37 @@ import os
 log = logging.getLogger(__name__)
 
 
+class _PendingLookupCall:
+    """Placeholder for a lookup reference whose builder is not available yet
+    while the AST is being walked.
+
+    It is used both for ``lookup Name;`` feature calls (where it keeps the
+    call's position inside a feature's lookup list) and for the named-lookup
+    slots of contextual rules. It is replaced by the real named lookup
+    builder by :meth:`Builder.resolve_pending_lookups_` once the whole AST
+    was visited.
+
+    Two pending references compare equal when they target the same name:
+    after resolution they would be the very same builder object, so this
+    preserves lookup de-duplication and contextual rule merging.
+    """
+
+    __slots__ = ("name", "location")
+
+    def __init__(self, name, location=None):
+        self.name = name
+        self.location = location
+
+    def __eq__(self, other):
+        return isinstance(other, _PendingLookupCall) and other.name == self.name
+
+    def __hash__(self):
+        return hash(("_PendingLookupCall", self.name))
+
+    def __repr__(self):
+        return "_PendingLookupCall(%r)" % self.name
+
+
 def addOpenTypeFeatures(font, featurefile, tables=None, debug=False):
     """Add features from a file to a font. Note that this replaces any features
     currently present.
@@ -141,6 +172,13 @@ class Builder(object):
         self.lookups_ = []
         self.lookup_locations = {"GSUB": {}, "GPOS": {}}
         self.features_ = {}  # ('latn', 'DEU ', 'smcp') --> [LookupBuilder*]
+        # Lookup references that could not be bound while walking the AST
+        # (forward references, or names added/changed by AST rewriting). They
+        # are resolved once the whole tree has been built, so that references
+        # to lookups defined later in the file keep their feature position.
+        self.pending_lookup_calls_ = []  # [(location, name)]
+        # Contextual lookup slots: [(location, name, inner_list, index)]
+        self.pending_contextual_lookups_ = []
         self.required_features_ = {}  # ('latn', 'DEU ') --> 'scmp'
         self.feature_variations_ = {}
         # for feature 'aalt'
@@ -188,6 +226,11 @@ class Builder(object):
         if self.parseTree is None:
             self.parseTree = Parser(self.file, self.glyphMap).parse()
         self.parseTree.build(self)
+        # All named lookup blocks have now been visited, so any lookup
+        # references that could not be bound during the walk (forward
+        # references or references produced/changed by AST rewriting) can be
+        # resolved; undefined names are reported here as build errors.
+        self.resolve_pending_lookups_()
         # by default, build all the supported tables
         if tables is None:
             tables = self.supportedTables
@@ -1180,12 +1223,67 @@ class Builder(object):
             self.lookupflag_ = 0
             self.lookupflag_markFilterSet_ = None
 
-    def add_lookup_call(self, lookup_name):
-        assert lookup_name in self.named_lookups_, lookup_name
+    def add_lookup_call(self, location=None, lookup_name=None, name=None):
+        # Accept both the historical ``add_lookup_call(lookup_name)`` form
+        # and the location-aware ``add_lookup_call(location, lookup_name)``.
+        if lookup_name is None and name is not None:
+            lookup_name = name
+        if lookup_name is None and isinstance(location, str):
+            lookup_name, location = location, None
         self.cur_lookup_ = None
-        lookup = self.named_lookups_[lookup_name]
-        if lookup is not None:  # skip empty named lookup
-            self.add_lookup_to_feature_(lookup, self.cur_feature_name_)
+        if lookup_name in self.named_lookups_:
+            lookup = self.named_lookups_[lookup_name]
+            if lookup is not None:  # skip empty named lookup
+                self.add_lookup_to_feature_(lookup, self.cur_feature_name_)
+            return
+
+        # The lookup has not been defined (or not built) yet. Parsing no
+        # longer rejects such references, so keep the call's position and
+        # validate/resolve it once the whole AST has been walked.
+        self.pending_lookup_calls_.append((location, lookup_name))
+        pending = _PendingLookupCall(lookup_name, location)
+        for script, lang in self.language_systems or ():
+            key = (script, lang, self.cur_feature_name_)
+            self.features_.setdefault(key, []).append(pending)
+
+    def resolve_pending_lookups_(self):
+        """Resolve lookup references deferred during the AST walk.
+
+        This is the build-phase counterpart of the parse-time lookup
+        resolution used by older feaLib releases. It reports a clear
+        :class:`FeatureLibError` for names that do not correspond to any
+        named lookup in the final (possibly rewritten) AST.
+        """
+        # Statement calls are recorded even when they are not attached to a
+        # feature's language systems, so validate all of them first.
+        for location, name in self.pending_lookup_calls_:
+            if name not in self.named_lookups_:
+                raise FeatureLibError('Unknown lookup "%s"' % name, location)
+
+        # Replace the placeholders that preserve call positions inside the
+        # feature lookup lists.
+        for key, lookups in list(self.features_.items()):
+            if not any(isinstance(l, _PendingLookupCall) for l in lookups):
+                continue
+            resolved = []
+            for lookup in lookups:
+                if isinstance(lookup, _PendingLookupCall):
+                    if lookup.name not in self.named_lookups_:
+                        raise FeatureLibError(
+                            'Unknown lookup "%s"' % lookup.name, lookup.location
+                        )
+                    builder = self.named_lookups_[lookup.name]
+                    if builder is not None:  # skip empty named lookup
+                        resolved.append(builder)
+                else:
+                    resolved.append(lookup)
+            self.features_[key] = resolved
+
+        # Resolve named-lookup slots inside contextual rules.
+        for location, name, inner, index in self.pending_contextual_lookups_:
+            if name not in self.named_lookups_:
+                raise FeatureLibError('Unknown lookup "%s"' % name, location)
+            inner[index] = self.named_lookups_[name]
 
     def set_font_revision(self, location, revision):
         self.fontRevision_ = revision
@@ -1318,20 +1416,39 @@ class Builder(object):
         self.lookupflag_markFilterSet_ = None
         self.set_language(location, "dflt", include_default=True, required=False)
 
-    def find_lookup_builders_(self, lookups):
+    def find_lookup_builders_(self, lookups, location=None):
         """Helper for building chain contextual substitutions
 
-        Given a list of lookup names, finds the LookupBuilder for each name.
-        If an input name is None, it gets mapped to a None LookupBuilder.
+        Given a list of lookup references, finds the LookupBuilder for each
+        name. If an input slot is None, it gets mapped to a None
+        LookupBuilder. References whose named lookup has not been built yet
+        (a forward reference or an unresolved AST name) get a pending
+        placeholder that is resolved by `resolve_pending_lookups_`; unknown
+        names are reported there.
         """
         lookup_builders = []
         for lookuplist in lookups:
-            if lookuplist is not None:
-                lookup_builders.append(
-                    [self.named_lookups_.get(l.name) for l in lookuplist]
-                )
-            else:
+            if lookuplist is None:
                 lookup_builders.append(None)
+                continue
+            # Be tolerant of ASTs that provide a single name/reference
+            # instead of a list at a contextual position.
+            if isinstance(lookuplist, str) or not hasattr(lookuplist, "__iter__"):
+                lookuplist = [lookuplist]
+            builders = []
+            for lookup in lookuplist:
+                name = getattr(lookup, "name", lookup)
+                if name in self.named_lookups_:
+                    builders.append(self.named_lookups_[name])
+                else:
+                    lookup_location = getattr(lookup, "location", location)
+                    pending = _PendingLookupCall(name, lookup_location)
+                    index = len(builders)
+                    builders.append(pending)
+                    self.pending_contextual_lookups_.append(
+                        (lookup_location, name, builders, index)
+                    )
+            lookup_builders.append(builders)
         return lookup_builders
 
     def add_attach_points(self, location, glyphs, contourPoints):
@@ -1503,7 +1620,7 @@ class Builder(object):
                 "Empty glyph class in contextual substitution", location
             )
         lookup = self.get_lookup_(location, ChainContextSubstBuilder)
-        resolved = self.find_lookup_builders_(lookups)
+        resolved = self.find_lookup_builders_(lookups, location)
         self._add_contextual_rule(lookup, prefix, glyphs, suffix, resolved)
 
     def add_single_subst_chained_(self, location, prefix, suffix, mapping):
@@ -1666,7 +1783,7 @@ class Builder(object):
                 "Empty glyph class in contextual positioning rule", location
             )
         lookup = self.get_lookup_(location, ChainContextPosBuilder)
-        resolved = self.find_lookup_builders_(lookups)
+        resolved = self.find_lookup_builders_(lookups, location)
         self._add_contextual_rule(lookup, prefix, glyphs, suffix, resolved)
 
     def add_single_pos_chained_(self, location, prefix, suffix, pos):

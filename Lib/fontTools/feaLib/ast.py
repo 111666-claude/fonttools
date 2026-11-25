@@ -54,6 +54,7 @@ __all__ = [
     "LigatureCaretByPosStatement",
     "LigatureSubstStatement",
     "LookupFlagStatement",
+    "LookupReference",
     "LookupReferenceStatement",
     "MarkBasePosStatement",
     "MarkLigPosStatement",
@@ -438,6 +439,18 @@ class LookupBlock(Block):
         Block.build(self, builder)
         builder.end_lookup_block()
 
+    def __eq__(self, other):
+        # Lookup blocks are identified by name; comparing against the name
+        # string also keeps name-based AST assertions working.
+        if isinstance(other, LookupBlock):
+            return self.name == other.name
+        if isinstance(other, str):
+            return self.name == other
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.name)
+
     def asFea(self, indent=""):
         res = "lookup {} ".format(self.name)
         if self.use_extension:
@@ -720,6 +733,11 @@ class ChainContextPosStatement(Statement):
         self.lookups = list(lookups)
         for i, lookup in enumerate(lookups):
             if lookup:
+                # A plain string names a single lookup reference; do not
+                # iterate it character by character.
+                if isinstance(lookup, str):
+                    self.lookups[i] = [lookup]
+                    continue
                 try:
                     iter(lookup)
                 except TypeError:
@@ -747,7 +765,7 @@ class ChainContextPosStatement(Statement):
                 res += g.asFea() + "'"
                 if self.lookups[i]:
                     for lu in self.lookups[i]:
-                        res += " lookup " + lu.name
+                        res += " lookup " + getattr(lu, "name", lu)
                 if i < len(self.glyphs) - 1:
                     res += " "
             if len(self.suffix):
@@ -778,6 +796,11 @@ class ChainContextSubstStatement(Statement):
         self.lookups = list(lookups)
         for i, lookup in enumerate(lookups):
             if lookup:
+                # A plain string names a single lookup reference; do not
+                # iterate it character by character.
+                if isinstance(lookup, str):
+                    self.lookups[i] = [lookup]
+                    continue
                 try:
                     iter(lookup)
                 except TypeError:
@@ -805,7 +828,7 @@ class ChainContextSubstStatement(Statement):
                 res += g.asFea() + "'"
                 if self.lookups[i]:
                     for lu in self.lookups[i]:
-                        res += " lookup " + lu.name
+                        res += " lookup " + getattr(lu, "name", lu)
                 if i < len(self.glyphs) - 1:
                     res += " "
             if len(self.suffix):
@@ -1148,21 +1171,123 @@ class LookupFlagStatement(Statement):
         return "lookupflag {};".format(" ".join(res))
 
 
+class LookupReference(Element):
+    """A by-name reference to a :class:`LookupBlock`.
+
+    This represents the ``lookup Name`` syntax used after marked glyphs in
+    contextual rules, e.g. ``sub a' lookup Foo b;``.
+
+    The parser does not check whether the referenced lookup exists, so the
+    reference may be *unresolved* (a forward reference, or a name that is
+    never defined). :attr:`name` always preserves the source name and
+    :attr:`location` its source location. :attr:`lookup` is the resolved
+    :class:`LookupBlock` when available, otherwise ``None``; the builder
+    performs final resolution and reports an error for references that are
+    still undefined in the finished AST.
+    """
+
+    def __init__(self, name, location=None, lookup=None):
+        Element.__init__(self, location)
+        self.name = name
+        self.lookup = lookup
+
+    def __eq__(self, other):
+        # Allow comparison with the source name (a string) or with the
+        # resolved LookupBlock, which keeps older AST assertions working.
+        if isinstance(other, LookupReference):
+            return other.name == self.name
+        if isinstance(other, str):
+            return other == self.name
+        if isinstance(other, LookupBlock):
+            return self.lookup is other or other.name == self.name
+        return NotImplemented
+
+    def __hash__(self):
+        # Consistent with equality against the name string/LookupBlock.
+        return hash(self.name)
+
+    def asFea(self, indent=""):
+        return "lookup {}".format(self.name)
+
+
 class LookupReferenceStatement(Statement):
     """Represents a ``lookup ...;`` statement to include a lookup in a feature.
 
-    The ``lookup`` should be a :class:`LookupBlock` object."""
+    The canonical reference is the lookup :attr:`name`. For backwards
+    compatibility, the first argument may alternatively be a
+    :class:`LookupBlock`; :attr:`name` is then derived from it. The
+    :attr:`lookup` attribute is the resolved :class:`LookupBlock` when the
+    parser could bind the name, and ``None`` for an unresolved reference.
+    The builder resolves :attr:`name` against the final AST, so renaming the
+    reference or adding the missing lookup before building is supported.
+    """
 
-    def __init__(self, lookup, location=None):
+    def __init__(
+        self,
+        lookup=None,
+        location=None,
+        *,
+        name=None,
+        lookup_name=None,
+        lookupName=None,
+    ):
         Statement.__init__(self, location)
-        self.location, self.lookup = (location, lookup)
+        if name is None:
+            name = lookup_name if lookup_name is not None else lookupName
+        self._lookup = None
+        if name is not None:
+            self.name = name
+            if isinstance(lookup, LookupBlock):
+                self._lookup = lookup
+        elif isinstance(lookup, LookupReference):
+            self.name = lookup.name
+            if location is None:
+                self.location = lookup.location
+            if isinstance(lookup.lookup, LookupBlock):
+                self._lookup = lookup.lookup
+        elif isinstance(lookup, str):
+            # Name-based reference; it may still be unresolved.
+            self.name = lookup
+        else:
+            # Historical API: an actual LookupBlock (or None).
+            self.name = getattr(lookup, "name", None)
+            if isinstance(lookup, LookupBlock):
+                self._lookup = lookup
+
+    @property
+    def lookup(self):
+        """The resolved :class:`LookupBlock`, or ``None`` if unresolved."""
+        return self._lookup
+
+    @lookup.setter
+    def lookup(self, value):
+        if isinstance(value, LookupBlock):
+            self._lookup = value
+            self.name = value.name
+        elif isinstance(value, str):
+            # Retarget the reference by name.
+            self._lookup = None
+            self.name = value
+        else:
+            self._lookup = value if isinstance(value, LookupBlock) else None
+
+    @property
+    def lookup_name(self):
+        """The referenced lookup name (alias for :attr:`name`)."""
+        return self.name
+
+    @property
+    def lookupName(self):
+        """Camel-case alias for :attr:`name`."""
+        return self.name
 
     def build(self, builder):
         """Calls the builder object's ``add_lookup_call`` callback."""
-        builder.add_lookup_call(self.lookup.name)
+        location = getattr(self, "name_location", None) or self.location
+        builder.add_lookup_call(location, self.name)
 
     def asFea(self, indent=""):
-        return "lookup {};".format(self.lookup.name)
+        return "lookup {};".format(self.name)
 
 
 class MarkBasePosStatement(Statement):

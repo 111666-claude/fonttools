@@ -869,12 +869,28 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(ref.lookup, foo)
 
     def test_lookup_reference_unknown(self):
-        self.assertRaisesRegex(
-            FeatureLibError,
-            'Unknown lookup "Huh"',
-            self.parse,
-            "feature liga {lookup Huh;} liga;",
-        )
+        # Undefined lookups are no longer a parse-time semantic error: the
+        # by-name reference (and its source location) is preserved in the
+        # AST so analysis/rewrite tools can read the file. The builder is
+        # responsible for rejecting references that stay unresolved.
+        doc = self.parse("feature liga {lookup Huh;} liga;")
+        [feature] = doc.statements
+        [ref] = feature.statements
+        self.assertIsInstance(ref, ast.LookupReferenceStatement)
+        self.assertEqual(ref.name, "Huh")
+        self.assertIsNone(ref.lookup)
+        self.assertIsNotNone(ref.location)
+        self.assertIn("lookup Huh;", doc.asFea())
+
+    def test_contextual_lookup_reference_unknown(self):
+        doc = self.parse("feature liga {sub A' lookup Huh B;} liga;")
+        [feature] = doc.statements
+        [chain] = feature.statements
+        [[ref]] = chain.lookups
+        self.assertIsInstance(ref, ast.LookupReference)
+        self.assertEqual(ref.name, "Huh")
+        self.assertIsNotNone(ref.location)
+        self.assertIn("lookup Huh", chain.asFea())
 
     def parse_lookupflag_(self, s):
         return self.parse("lookup L {%s} L;" % s).statements[0].statements[-1]

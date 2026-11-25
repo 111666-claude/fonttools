@@ -64,6 +64,12 @@ class Parser(object):
         self.anchors_ = SymbolTable()
         self.glyphclasses_ = SymbolTable()
         self.lookups_ = SymbolTable()
+        # By-name lookup references collected while parsing; they are bound
+        # best-effort once the whole file has been parsed, so that forward
+        # references are linked as well. Unresolved ones stay as name nodes
+        # and are only rejected by the builder.
+        self.lookup_reference_statements_ = []
+        self.contextual_lookup_references_ = []
         self.valuerecords_ = SymbolTable()
         self.symbol_tables_ = {self.anchors_, self.valuerecords_}
         self.next_token_type_, self.next_token_ = (None, None)
@@ -124,6 +130,11 @@ class Parser(object):
                     ),
                     self.cur_token_location_,
                 )
+        # Best-effort binding of lookup references now that every lookup
+        # block in the file has been seen. This never raises: names that
+        # cannot be resolved remain explicit reference nodes and are only
+        # rejected when the AST is built.
+        self.bind_lookup_references_()
         # Report any missing glyphs at the end of parsing
         if self.missing:
             error = [
@@ -136,6 +147,23 @@ class Parser(object):
                 None,
             )
         return self.doc_
+
+    def bind_lookup_references_(self):
+        """Best-effort link of by-name lookup references to LookupBlocks.
+
+        Runs after the whole file has been parsed, so references written
+        before their lookup definition are linked too. References without a
+        matching definition are deliberately left unresolved; the builder
+        reports them if they are still missing from the final AST.
+        """
+        for statement in self.lookup_reference_statements_:
+            block = self.lookups_.resolve(statement.name)
+            if block is not None:
+                statement.lookup = block
+        for items, index, name in self.contextual_lookup_references_:
+            block = self.lookups_.resolve(name)
+            if block is not None:
+                items[index] = block
 
     def parse_anchor_(self):
         # Parses an anchor in any of the four formats given in the feature
@@ -475,12 +503,23 @@ class Parser(object):
                         self.cur_token_location_,
                     )
                 lookup_name = self.expect_name_()
-                lookup = self.lookups_.resolve(lookup_name)
-                if lookup is None:
-                    raise FeatureLibError(
-                        'Unknown lookup "%s"' % lookup_name, self.cur_token_location_
+                lookup_location = self.cur_token_location_
+                # Resolve immediately when the lookup is already visible
+                # (preserves the historical LookupBlock value); otherwise
+                # keep a by-name node and try again at the end of parse(),
+                # which also links forward references. Unresolved references
+                # are left for the builder to reject.
+                block = self.lookups_.resolve(lookup_name)
+                if block is not None:
+                    lookuplist.append(block)
+                else:
+                    lookup_ref = self.ast.LookupReference(
+                        lookup_name, location=lookup_location
                     )
-                lookuplist.append(lookup)
+                    lookuplist.append(lookup_ref)
+                    self.contextual_lookup_references_.append(
+                        (lookuplist, len(lookuplist) - 1, lookup_name)
+                    )
             if marked:
                 lookups.append(lookuplist)
 
@@ -655,13 +694,19 @@ class Parser(object):
         location, name = self.cur_token_location_, self.expect_name_()
 
         if self.next_token_ == ";":
-            lookup = self.lookups_.resolve(name)
-            if lookup is None:
-                raise FeatureLibError(
-                    'Unknown lookup "%s"' % name, self.cur_token_location_
-                )
+            # References are kept by name and are *not* validated here: a
+            # lookup may be defined later in the same file, or the AST may
+            # be analyzed/rewritten before building. A best-effort binding
+            # is performed at the end of parse().
+            name_location = self.cur_token_location_
             self.expect_symbol_(";")
-            return self.ast.LookupReferenceStatement(lookup, location=location)
+            reference = self.ast.LookupReferenceStatement(name, location=location)
+            reference.name_location = name_location
+            block = self.lookups_.resolve(name)
+            if block is not None:
+                reference.lookup = block
+            self.lookup_reference_statements_.append(reference)
+            return reference
 
         use_extension = False
         if self.next_token_ == "useExtension":
