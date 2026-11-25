@@ -125,6 +125,7 @@ from fontTools.varLib.merger import MutatorMerger
 from fontTools.varLib.instancer import names
 from fontTools.varLib.varStore import NO_VARIATION_INDEX
 from .featureVars import instantiateFeatureVariations
+from .colr import instantiateCOLR
 from fontTools.misc.cliTools import makeOutputFileName
 from fontTools.varLib.instancer import solver
 from fontTools.ttLib.tables.otTables import VarComponentFlags
@@ -405,6 +406,9 @@ class AxisLimits(_BaseAxisLimits):
         fvarTriples = {
             a.axisTag: (a.minValue, a.defaultValue, a.maxValue) for a in fvar.axes
         }
+        badLimits = set(self.keys()).difference(fvarTriples)
+        if badLimits:
+            raise ValueError(f"Cannot limit: {badLimits} not present in fvar")
         newLimits = {}
         for axisTag, triple in self.items():
             fvarTriple = fvarTriples[axisTag]
@@ -2551,6 +2555,8 @@ def _instantiateVariationTables(varfont, limits, optimize, downgradeCFF2):
 
     if "VVAR" in varfont:
         instantiateVVAR(varfont, limits)
+
+    instantiateCOLR(varfont, limits)
 
     instantiateOTL(varfont, limits)
 
