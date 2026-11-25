@@ -3,6 +3,8 @@ from fontTools.misc.roundTools import noRound
 from fontTools.misc.testTools import stripVariableItemsFromTTX
 from fontTools.misc.textTools import Tag
 from fontTools.pens.recordingPen import RecordingPen
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.fontBuilder import FontBuilder
 from fontTools import ttLib
 from fontTools import designspaceLib
 from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
@@ -2649,6 +2651,96 @@ def _getSubstitutions(gsub, lookupIndices):
     return subs
 
 
+def makeConditionFormatFont(conditionFormats=None):
+    """Build a saveable variable font with GSUB and GPOS FeatureVariations.
+
+    The GSUB record is a valid format 1 condition. ``conditionFormats`` is an
+    optional mapping of table tag to a list of condition formats to place in
+    that table's first FeatureVariationRecord instead (format 1 entries get
+    valid ranges). A GDEF item variation store is included so that the
+    instancer has variation data it would otherwise rewrite before reaching
+    FeatureVariations.
+    """
+    fb = FontBuilder(1000)
+    order = [".notdef", "dollar", "dollar.nostroke"]
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({0x24: "dollar"})
+    fb.setupGlyf({name: TTGlyphPen(None).glyph() for name in order})
+    fb.setupHorizontalMetrics({name: (500, 0) for name in order})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": "Conditions", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.setupFvar(
+        [("wght", 100, 400, 900, "Weight"), ("wdth", 50, 100, 200, "Width")],
+        [],
+    )
+    font = fb.font
+    addOpenTypeFeaturesFromString(
+        font,
+        "feature liga { sub dollar by dollar.nostroke; } liga;"
+        "feature kern { pos dollar 10; } kern;",
+    )
+    featureVars.addFeatureVariations(
+        font,
+        [([{"wght": (0.5, 1.0)}], {"dollar": "dollar.nostroke"})],
+        featureTag="liga",
+    )
+
+    # Give GPOS its own FeatureVariations table (using the kern feature).
+    gpos = font["GPOS"].table
+    gpos.Version = 0x00010001
+    gpos.FeatureVariations = featureVars.buildFeatureVariations(
+        [
+            featureVars.buildFeatureVariationRecord(
+                [featureVars.buildConditionTable(0, 0.5, 1.0)],
+                [featureVars.buildFeatureTableSubstitutionRecord(0, [0])],
+            )
+        ]
+    )
+
+    # A non-empty GDEF item variation store, which instancing rewrites.
+    gdef = font["GDEF"] = ttLib.newTable("GDEF")
+    gdef.table = otTables.GDEF()
+    gdef.table.Version = 0x00010003
+    gdef.table.GlyphClassDef = None
+    gdef.table.AttachList = None
+    gdef.table.LigCaretList = None
+    gdef.table.MarkAttachClassDef = None
+    gdef.table.MarkGlyphSetsDef = None
+    gdef.table.VarStore = builder.buildVarStore(
+        builder.buildVarRegionList([{"wght": (0.5, 1.0, 1.0)}], ["wght", "wdth"]),
+        [builder.buildVarData([0], [[10]])],
+    )
+
+    for tableTag, formats in (conditionFormats or {}).items():
+        record = font[tableTag].table.FeatureVariations.FeatureVariationRecord[0]
+        conditions = []
+        for fmt in formats:
+            condition = otTables.ConditionTable()
+            condition.Format = fmt
+            if fmt == 1:
+                condition.AxisIndex = 0
+                condition.FilterRangeMinValue = 0.5
+                condition.FilterRangeMaxValue = 1.0
+            else:
+                # Formats 2-5 are valid OpenType but unsupported here.
+                condition.DefaultValue = 1
+                condition.VarIdx = 0xFFFFFFFF
+            conditions.append(condition)
+        record.ConditionSet.ConditionTable = conditions
+        record.ConditionSet.ConditionCount = len(conditions)
+
+    return font
+
+
+def _reloaded(font):
+    data = BytesIO()
+    font.save(data)
+    data.seek(0)
+    return ttLib.TTFont(data)
+
+
 def makeFeatureVarsFont(conditionalSubstitutions):
     axes = set()
     glyphs = set()
@@ -2877,7 +2969,7 @@ class InstantiateFeatureVariationsTest(object):
         lookupIndices = gsub.FeatureList.FeatureRecord[0].Feature.LookupListIndex
         assert _getSubstitutions(gsub, lookupIndices) == {"uni0024": "uni0024.nostroke"}
 
-    def test_unsupported_condition_format(self, caplog):
+    def test_unsupported_condition_format(self):
         font = makeFeatureVarsFont(
             [
                 (
@@ -2890,23 +2982,161 @@ class InstantiateFeatureVariationsTest(object):
         rec1 = featureVariations.FeatureVariationRecord[0]
         assert len(rec1.ConditionSet.ConditionTable) == 2
         rec1.ConditionSet.ConditionTable[0].Format = 2
+        rec1.ConditionSet.ConditionTable[0].DefaultValue = 1
+        rec1.ConditionSet.ConditionTable[0].VarIdx = 0xFFFFFFFF
+        original = BytesIO()
+        font.saveXML(original)
 
-        with caplog.at_level(logging.WARNING, logger="fontTools.varLib.instancer"):
+        with pytest.raises(
+            NotImplementedError,
+            match=r"GSUB FeatureVariations condition format 2 is not supported "
+            r"\(FeatureVariationRecord 0, condition 0\)",
+        ):
             instancer.instantiateFeatureVariations(
                 font, instancer.NormalizedAxisLimits(wdth=0)
             )
 
-        assert (
-            "Condition table 0 of FeatureVariationRecord 0 "
-            "has unsupported format (2); ignored"
-        ) in caplog.text
+        # Nothing was modified: no partial instancing, no dropped records.
+        after = BytesIO()
+        font.saveXML(after)
+        assert after.getvalue() == original.getvalue()
 
-        # check that record with unsupported condition format (but whose other
-        # conditions do not reference pinned axes) is kept as is
-        featureVariations = font["GSUB"].table.FeatureVariations
-        assert featureVariations.FeatureVariationRecord[0] is rec1
-        assert len(rec1.ConditionSet.ConditionTable) == 2
-        assert rec1.ConditionSet.ConditionTable[0].Format == 2
+    @pytest.mark.parametrize("inplace", [False, True], ids=["copy", "inplace"])
+    @pytest.mark.parametrize("tableTag", ["GSUB", "GPOS"])
+    @pytest.mark.parametrize("conditionFormats", [[2], [4], [1, 3], [9]])
+    def test_unsupported_condition_format_fails_before_mutation(
+        self, inplace, tableTag, conditionFormats
+    ):
+        # Formats 2-5 are valid OpenType conditions that this instancer cannot
+        # evaluate; an unknown format such as 9 is invalid outright. Either way
+        # the whole font must be left untouched instead of being partially
+        # instanced and then silently wrong.
+        font = makeConditionFormatFont({tableTag: conditionFormats})
+        font = _reloaded(font)
+
+        original = BytesIO()
+        font.saveXML(original)
+        gdefVarStore = font["GDEF"].table.VarStore
+        varStoreItem = gdefVarStore.VarData[0].Item[0]
+        glyphOrder = list(font.getGlyphOrder())
+        lookupList = font[tableTag].table.LookupList
+        lookups = list(lookupList.Lookup)
+        record = font[tableTag].table.FeatureVariations.FeatureVariationRecord[0]
+        conditionSet = record.ConditionSet
+
+        badFormat = next(fmt for fmt in conditionFormats if fmt != 1)
+        badIndex = conditionFormats.index(badFormat)
+        pattern = (
+            rf"{tableTag} FeatureVariations condition format {badFormat} "
+            rf"is not supported \(FeatureVariationRecord 0, condition {badIndex}\)"
+        )
+        # Repeat calls: the error is deterministic and the font never changes.
+        for _ in range(2):
+            with pytest.raises(NotImplementedError, match=pattern):
+                if inplace:
+                    instancer.instantiateVariableFont(font, {"wght": 900}, inplace=True)
+                else:
+                    instancer.instantiateVariableFont(font, {"wght": 900})
+
+            after = BytesIO()
+            font.saveXML(after)
+            assert after.getvalue() == original.getvalue()
+
+            # Identity of the input objects is preserved too.
+            assert font["GDEF"].table.VarStore is gdefVarStore
+            assert font["GDEF"].table.VarStore.VarData[0].Item[0] is varStoreItem
+            assert font.getGlyphOrder() == glyphOrder
+            assert font[tableTag].table.LookupList is lookupList
+            assert font[tableTag].table.LookupList.Lookup == lookups
+            assert (
+                font[tableTag]
+                .table.FeatureVariations.FeatureVariationRecord[0]
+                .ConditionSet
+                is conditionSet
+            )
+
+    @pytest.mark.parametrize(
+        "tableTag, conditionFormats",
+        [
+            # valid in the other table, unsupported in the one checked second
+            ("GSUB", [2]),
+            ("GPOS", [3]),
+            ("GSUB", [5]),
+        ],
+    )
+    def test_unsupported_condition_format_checks_both_tables(
+        self, tableTag, conditionFormats
+    ):
+        # The pre-check must not bail out after the first clean table; it has
+        # to look at GSUB and GPOS and name the offending one.
+        font = makeConditionFormatFont({tableTag: conditionFormats})
+        badFormat = conditionFormats[0]
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"^{tableTag} FeatureVariations condition format {badFormat}",
+        ):
+            instancer.instantiateVariableFont(font, {"wght": 900})
+
+    @pytest.mark.parametrize("inplace", [False, True], ids=["copy", "inplace"])
+    def test_supported_condition_formats_still_instance(self, inplace):
+        # Valid fonts keep instancing exactly as before: the pre-check is a
+        # no-op for supported (format 1) conditions.
+        font = makeConditionFormatFont()
+        reference = _reloaded(font)
+
+        font = _reloaded(font)
+        original = BytesIO()
+        font.saveXML(original)
+
+        instance = instancer.instantiateVariableFont(
+            font, {"wght": 900}, inplace=inplace
+        )
+        if not inplace:
+            # A copy was instanced; the input font is untouched.
+            assert font["GDEF"].table.VarStore is not None
+            after = BytesIO()
+            font.saveXML(after)
+            assert after.getvalue() == original.getvalue()
+
+        # The instance differs from the input and round-trips through binary.
+        instanced = BytesIO()
+        instance.save(instanced)
+        assert instanced.getvalue() != original.getvalue()
+        reloaded = ttLib.TTFont(BytesIO(instanced.getvalue()))
+        assert reloaded["GSUB"].table.Version == 0x00010000
+        assert reloaded["GPOS"].table.Version == 0x00010000
+        assert "GDEF" not in reloaded
+        # The rvrn/liga substitution was baked into the default feature.
+        gsub = reloaded["GSUB"].table
+        liga = next(
+            rec for rec in gsub.FeatureList.FeatureRecord if rec.FeatureTag == "liga"
+        )
+        assert _getSubstitutions(gsub, liga.Feature.LookupListIndex) == {
+            "dollar": "dollar.nostroke"
+        }
+
+        # Instancing the reference independently must give the same bytes.
+        referenceInstance = instancer.instantiateVariableFont(reference, {"wght": 900})
+        referenceBytes = BytesIO()
+        referenceInstance.save(referenceBytes)
+        assert referenceBytes.getvalue() == instanced.getvalue()
+
+        # A partial instance keeps FeatureVariations and both axes. Start from
+        # a fresh font, since the inplace run above consumed the first one.
+        partial = instancer.instantiateVariableFont(
+            _reloaded(makeConditionFormatFont()), {"wdth": 70}
+        )
+        partialBytes = BytesIO()
+        partial.save(partialBytes)
+        partialReloaded = ttLib.TTFont(BytesIO(partialBytes.getvalue()))
+        assert partialReloaded["GSUB"].table.Version == 0x00010001
+        assert partialReloaded["GPOS"].table.Version == 0x00010001
+        assert (
+            partialReloaded["GSUB"].table.FeatureVariations.FeatureVariationCount == 1
+        )
+        assert (
+            partialReloaded["GPOS"].table.FeatureVariations.FeatureVariationCount == 1
+        )
 
     def test_GSUB_FeatureVariations_is_None(self, varfont2):
         varfont2["GSUB"].table.Version = 0x00010001

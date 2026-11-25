@@ -1,6 +1,11 @@
 4.66.1 (released 2026-09-29)
 ----------------------------
 
+- [instancer] Instancing a font whose ``GSUB``/``GPOS`` FeatureVariations contain a
+  condition format other than format 1 now raises ``NotImplementedError`` naming the
+  table, record and condition before the font is modified, instead of logging a
+  warning, ignoring the condition and leaving a partially instanced font behind
+  (#4348).
 - [designspaceLib] When splitting a DesignSpace v5 document with ``makeNames=True``
   (as ``varLib.build_many`` does), family and style names set explicitly on an
   instance now take precedence over the ones computed from the STAT labels, in

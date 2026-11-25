@@ -11,6 +11,8 @@ def _featureVariationRecordIsUnique(rec, seen):
         rec.ConditionSet.ConditionTable if rec.ConditionSet is not None else []
     )
     for cond in conditionSets:
+        if cond is None:
+            continue
         if cond.Format != 1:
             # can't tell whether this is duplicate, assume is unique
             return True
@@ -61,6 +63,8 @@ def _instantiateFeatureVariationRecord(
         record.ConditionSet.ConditionTable = []
         record.ConditionSet.ConditionCount = 0
     for i, condition in enumerate(record.ConditionSet.ConditionTable):
+        if condition is None:
+            continue
         if condition.Format == 1:
             axisIdx = condition.AxisIndex
             axisTag = fvarAxes[axisIdx].axisTag
@@ -97,12 +101,12 @@ def _instantiateFeatureVariationRecord(
                     break
 
         else:
-            log.warning(
-                "Condition table {0} of FeatureVariationRecord {1} has "
-                "unsupported format ({2}); ignored".format(i, recIdx, condition.Format)
+            # Unsupported conditions are rejected up front by
+            # _checkFeatureVariationConditions, before the font is modified.
+            raise NotImplementedError(
+                "FeatureVariations condition format {0} is not supported "
+                "(record {1}, condition {2})".format(condition.Format, recIdx, i)
             )
-            applies = False
-            newConditions.append(condition)
 
     if newConditions is not None and shouldKeep:
         record.ConditionSet.ConditionTable = newConditions
@@ -175,7 +179,43 @@ def _instantiateFeatureVariations(table, fvarAxes, axisLimits):
         table.Version = 0x00010000
 
 
+def _checkFeatureVariationConditions(varfont):
+    """Fail if any layout FeatureVariations condition is unsupported.
+
+    Only ConditionTableFormat1 can be instantiated; other formats (e.g. the
+    variable-value formats 2-5) cannot be evaluated here. This must run before
+    the font is modified, otherwise callers are left with a partially
+    instanced font whose FeatureVariations are silently wrong.
+    """
+    # Check both tables before any instancing changes their stores or features.
+    for tableTag in ("GSUB", "GPOS"):
+        if tableTag not in varfont:
+            continue
+        variations = getattr(varfont[tableTag].table, "FeatureVariations", None)
+        if variations is None:
+            continue
+        for recordIdx, record in enumerate(
+            getattr(variations, "FeatureVariationRecord", None) or []
+        ):
+            conditionSet = getattr(record, "ConditionSet", None)
+            if conditionSet is None:
+                continue
+            for conditionIdx, condition in enumerate(
+                getattr(conditionSet, "ConditionTable", None) or []
+            ):
+                if condition is None:
+                    continue
+                if condition.Format != 1:
+                    raise NotImplementedError(
+                        f"{tableTag} FeatureVariations condition format "
+                        f"{condition.Format} is not supported "
+                        f"(FeatureVariationRecord {recordIdx}, "
+                        f"condition {conditionIdx})"
+                    )
+
+
 def instantiateFeatureVariations(varfont, axisLimits):
+    _checkFeatureVariationConditions(varfont)
     for tableTag in ("GPOS", "GSUB"):
         if tableTag not in varfont or not getattr(
             varfont[tableTag].table, "FeatureVariations", None
