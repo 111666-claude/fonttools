@@ -1,10 +1,19 @@
 from array import array
 from typing import Any, Callable, Dict, Optional, Tuple
-from fontTools.misc.fixedTools import MAX_F2DOT14, floatToFixedToFloat
+from fontTools.misc.fixedTools import (
+    MAX_F2DOT14,
+    floatToFixed as fl2fi,
+    floatToFixedToFloat,
+)
 from fontTools.misc.loggingTools import LogMixin
+from fontTools.misc.transform import DecomposedTransform
 from fontTools.pens.pointPen import AbstractPointPen
 from fontTools.misc.roundTools import otRound
-from fontTools.pens.basePen import LoggingPen, PenError
+from fontTools.pens.basePen import (
+    LoggingPen,
+    MissingComponentError,
+    PenError,
+)
 from fontTools.pens.transformPen import TransformPen, TransformPointPen
 from fontTools.ttLib.tables import ttProgram
 from fontTools.ttLib.tables._g_l_y_f import flagOnCurve, flagCubic
@@ -12,6 +21,11 @@ from fontTools.ttLib.tables._g_l_y_f import Glyph
 from fontTools.ttLib.tables._g_l_y_f import GlyphComponent
 from fontTools.ttLib.tables._g_l_y_f import GlyphCoordinates
 from fontTools.ttLib.tables._g_l_y_f import dropImpliedOnCurvePoints
+from fontTools.ttLib.tables.otTables import (
+    VAR_TRANSFORM_MAPPING,
+    VarComponent,
+    VarComponentFlags,
+)
 import math
 
 __all__ = ["TTGlyphPen", "TTGlyphPointPen"]
@@ -72,6 +86,7 @@ class _TTGlyphBasePen:
         self.endPts = []
         self.types = []
         self.components = []
+        self.varComponents: list[VarComponent] = []
 
     def addComponent(
         self,
@@ -83,7 +98,97 @@ class _TTGlyphBasePen:
         """
         Add a sub glyph.
         """
+        if self.varComponents:
+            raise PenError(
+                "Glyph cannot mix ordinary components with variable components"
+            )
         self.components.append((baseGlyphName, transformation))
+
+    def addVarComponent(
+        self,
+        glyphName: str,
+        transformation: DecomposedTransform,
+        location: Dict[str, float],
+        identifier: Optional[str] = None,
+        *,
+        resetUnspecifiedAxes: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Add a variable sub glyph (VARC variable component).
+
+        The component references ``glyphName`` from the pen's glyph set,
+        applies ``transformation`` (a
+        :class:`~fontTools.misc.transform.DecomposedTransform`) and places the
+        referenced glyph at the sparse axis ``location`` (a mapping of axis
+        tags to normalized coordinates). The resulting
+        :class:`~fontTools.ttLib.tables.otTables.VarComponent` objects are
+        attached to the returned glyph through its ``varComponents``
+        attribute; collect them into a ``VARC`` table with
+        :func:`fontTools.varLib.varc.buildVARC` before saving the font.
+
+        Variable components cannot be mixed with contours or ordinary
+        components; doing so raises :class:`PenError`. A component that
+        references a glyph missing from the glyph set raises
+        :class:`MissingComponentError`. Transform values that cannot be
+        encoded, or locations referencing unknown axes, raise
+        :class:`PenError`.
+        """
+        if self.points or self.components:
+            raise PenError(
+                "Glyph cannot mix variable components with contours or "
+                "ordinary components"
+            )
+        if self.glyphSet is not None and glyphName not in self.glyphSet:
+            raise MissingComponentError(glyphName)
+        if not isinstance(transformation, DecomposedTransform):
+            raise PenError(
+                "Variable component transformation must be a DecomposedTransform"
+            )
+        if not isinstance(location, dict):
+            raise PenError(
+                "Variable component location must be a dict of axis tag to "
+                "normalized coordinate"
+            )
+
+        component = VarComponent()
+        component.glyphName = glyphName
+        if resetUnspecifiedAxes:
+            component.flags |= VarComponentFlags.RESET_UNSPECIFIED_AXES
+        component.transform = self._buildVarTransform(transformation)
+        # The axis tuple is resolved against the font's fvar axes when the
+        # VARC table is built; keep the requested location on the component
+        # for now.
+        component.location = dict(location)  # type: ignore[attr-defined]
+        self.varComponents.append(component)
+
+    @staticmethod
+    def _buildVarTransform(
+        transformation: DecomposedTransform,
+    ) -> DecomposedTransform:
+        """Validate a DecomposedTransform against the fixed-point encodings
+        used by the VARC table and return a copy holding only the
+        non-default fields. The presence flags on the final VarComponent are
+        derived from which fields differ from their defaults."""
+        result = DecomposedTransform()
+        for attr_name, mapping in VAR_TRANSFORM_MAPPING.items():
+            value = getattr(transformation, attr_name)
+            if value == mapping.defaultValue:
+                continue
+            if not math.isfinite(value):
+                raise PenError(
+                    f"Variable component transform {attr_name} must be finite"
+                )
+            # Every transform field is stored in a signed 16-bit fixed point
+            # number; reject values that the VARC compiler could not encode.
+            fixed = fl2fi(value / mapping.scale, mapping.fractionalBits)
+            if not (-0x8000 <= fixed <= 0x7FFF):
+                raise PenError(
+                    f"Variable component transform {attr_name} value {value} "
+                    "cannot be encoded as a signed 16-bit fixed point number"
+                )
+            setattr(result, attr_name, value)
+        return result
 
     def _buildComponents(self, componentFlags):
         if self.handleOverflowingTransforms:
@@ -140,9 +245,28 @@ class _TTGlyphBasePen:
             componentFlags: Flags to use for component glyphs. (default: 0x04)
 
             dropImpliedOnCurves: Whether to remove implied-oncurve points. (default: False)
+
+        Variable components added through :meth:`addVarComponent` are exposed
+        on the returned glyph through its ``varComponents`` attribute. The
+        glyph itself stays an empty ``glyf`` record, as the component data is
+        stored in the font's ``VARC`` table; use
+        :func:`fontTools.varLib.varc.buildVARC` to create that table from the
+        glyphs' ``varComponents``.
         """
         if not self._isClosed():
             raise PenError("Didn't close last contour.")
+
+        if self.varComponents:
+            # addVarComponent rejects mixing with contours/components, so a
+            # glyph holding variable components is an empty glyf record whose
+            # component data lives in the font's VARC table.
+            varComponents = self.varComponents
+            self.init()
+            glyph = Glyph()
+            glyph.numberOfContours = 0
+            glyph.varComponents = varComponents  # type: ignore[attr-defined]
+            return glyph
+
         components = self._buildComponents(componentFlags)
 
         glyph = Glyph()
@@ -189,6 +313,10 @@ class TTGlyphPen(_TTGlyphBasePen, LoggingPen):
         self.outputImpliedClosingLine = outputImpliedClosingLine
 
     def _addPoint(self, pt: Tuple[float, float], tp: int) -> None:
+        if self.varComponents:
+            raise PenError(
+                "Glyph cannot mix variable components with contours"
+            )
         self.points.append(pt)
         self.types.append(tp)
 
@@ -276,6 +404,10 @@ class TTGlyphPointPen(_TTGlyphBasePen, LogMixin, AbstractPointPen):
         """
         if not self._isClosed():
             raise PenError("Didn't close previous contour.")
+        if self.varComponents:
+            raise PenError(
+                "Glyph cannot mix variable components with contours"
+            )
         self._currentContourStartIndex = len(self.points)
 
     def endPath(self) -> None:

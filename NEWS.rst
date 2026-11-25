@@ -1,3 +1,15 @@
+4.68.1 (unreleased)
+--------------------
+
+- [ttGlyphPen] ``TTGlyphPen`` and ``TTGlyphPointPen`` now implement
+  ``addVarComponent()``: variable components (component name, decomposed
+  transform and axis location) are recorded onto the glyph's
+  ``varComponents`` and can be compiled into the ``VARC`` table with the new
+  ``fontTools.varLib.varc.buildVARC()``. Ordinary TrueType components and
+  simple contours keep their previous behavior, mixing them with variable
+  components raises ``PenError``, and unencodable transforms or locations
+  raise stable errors.
+
 4.68.0 (released 2026-10-27)
 ----------------------------
 

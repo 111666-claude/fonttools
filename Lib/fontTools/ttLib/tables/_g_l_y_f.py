@@ -724,8 +724,14 @@ class Glyph(object):
 
     def compact(self, glyfTable, recalcBBoxes=True):
         data = self.compile(glyfTable, recalcBBoxes)
+        # Variable components live in the VARC table, not in the glyf
+        # record; keep any build-time varComponents across compaction so
+        # the VARC table can still be (re)built from the glyph.
+        varComponents = getattr(self, "varComponents", None)
         self.__dict__.clear()
         self.data = data
+        if varComponents is not None:
+            self.varComponents = varComponents
 
     def expand(self, glyfTable):
         if not hasattr(self, "data"):
@@ -1324,6 +1330,11 @@ class Glyph(object):
             return struct.unpack(">h", self.data[:2])[0] == -1 if self.data else False
         else:
             return self.numberOfContours == -1
+
+    def isVarComposite(self):
+        """Test whether a glyph has variable components (stored in the
+        ``VARC`` table; the glyf record itself stays empty)."""
+        return bool(getattr(self, "varComponents", None))
 
     def getCoordinates(self, glyfTable, *, round=noRound):
         """Return the coordinates, end points and flags
