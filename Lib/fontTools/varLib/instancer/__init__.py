@@ -2727,6 +2727,124 @@ def setMacOverlapFlags(glyfTable):
             glyph.flags[0] |= flagOverlapSimple
 
 
+def _cmapRootGlyphs(font):
+    """Return (glyphNames, unicodes) referenced by every cmap subtable.
+
+    All subtables are considered, not just the best Unicode cmap, so that
+    platform-specific mappings and format 14 variation sequences keep their
+    glyphs as well.
+    """
+    glyphNames = set()
+    unicodes = set()
+    if "cmap" not in font:
+        return glyphNames, unicodes
+    for subtable in font["cmap"].tables:
+        cmap = getattr(subtable, "cmap", None)
+        if cmap:
+            for codepoint, glyphName in cmap.items():
+                if isinstance(codepoint, int):
+                    unicodes.add(codepoint)
+                if isinstance(glyphName, str):
+                    glyphNames.add(glyphName)
+        # cmap format 14 stores non-default UVS mappings as
+        # uvsDict[variationSelector] = [(codepoint, glyphName-or-None), ...]
+        uvsDict = getattr(subtable, "uvsDict", None)
+        if uvsDict:
+            for entries in uvsDict.values():
+                for entry in entries:
+                    if not isinstance(entry, tuple) or len(entry) != 2:
+                        continue
+                    codepoint, glyphName = entry
+                    if isinstance(codepoint, int):
+                        unicodes.add(codepoint)
+                    if isinstance(glyphName, str):
+                        glyphNames.add(glyphName)
+    return glyphNames, unicodes
+
+
+def _pruneUnreachableGlyphs(font):
+    """Remove glyphs that are unreachable in the instanced ``font``.
+
+    FeatureVariations culling and lookup pruning can leave glyphs in the
+    font that are no longer referenced by the surviving cmap, GSUB/GPOS
+    lookups, composite glyphs, COLR paint graphs or other glyph-bearing
+    tables. Compute the reachability closure from the font as it stands
+    *after* instancing and run the standard subsetter with options tuned so
+    that only unreachable glyphs (and their per-glyph records) are removed:
+    every table, name record, layout feature and glyph name that is not
+    intrinsically tied to a removed glyph is preserved.
+
+    The font is modified in place and returned.
+    """
+    glyphOrderBefore = list(font.getGlyphOrder())
+
+    rootGlyphNames, rootUnicodes = _cmapRootGlyphs(font)
+    if not rootGlyphNames:
+        # Without any cmap entry there is no safe root set: subsetting would
+        # reduce the font to .notdef even though glyphs may be referenced by
+        # tables the closure does not seed from. Do nothing rather than destroy
+        # potentially reachable glyphs.
+        log.warning(
+            "Refusing to prune unreachable glyphs: font has no usable cmap mapping"
+        )
+        return font
+
+    options = subset.Options()
+    # Keep original glyph names and the .notdef outline; compact the glyph
+    # order while preserving the relative order of surviving glyphs.
+    options.glyph_names = True
+    options.notdef_glyph = True
+    options.notdef_outline = True
+    options.recommended_glyphs = False
+    options.retain_gids = False
+    # Only glyphs should be pruned. Keep every table (even ones the subsetter
+    # does not know how to rewrite) and every name/layout feature/language.
+    options.drop_tables = []
+    options.passthrough_tables = True
+    options.name_IDs = list(range(0x10000))
+    options.name_legacy = True
+    options.name_languages = ["*"]
+    options.layout_features = ["*"]
+    options.layout_scripts = ["*"]
+    options.layout_closure = True
+    options.bidi_closure = True
+    options.legacy_kern = True
+    options.hinting = True
+    # Roots are taken from the actual cmap, so missing entries are not fatal.
+    options.ignore_missing_glyphs = True
+    options.ignore_missing_unicodes = True
+    # Do not let unrelated OS/2 range bits change; refresh xAvgCharWidth since
+    # glyph widths may have disappeared with the removed glyphs.
+    options.prune_unicode_ranges = False
+    options.prune_codepage_ranges = False
+    options.recalc_average_width = True
+    options.recalc_bounds = False
+    options.recalc_timestamp = False
+
+    subsetter = subset.Subsetter(options=options)
+    subsetter.populate(glyphs=sorted(rootGlyphNames), unicodes=sorted(rootUnicodes))
+    subsetter.subset(font)
+
+    surviving = set(font.getGlyphOrder())
+    removedGlyphs = [name for name in glyphOrderBefore if name not in surviving]
+    if removedGlyphs:
+        log.info(
+            "Pruned %d unreachable glyph(s): %s",
+            len(removedGlyphs),
+            ", ".join(removedGlyphs),
+        )
+    return font
+
+
+# Public aliases: the instancer's historical API uses camelCase, while the
+# parameter wording in the issue tracker talks about "unused/unreachable
+# glyphs". Accept both spellings.
+pruneUnreachableGlyphs = _pruneUnreachableGlyphs
+prune_unreachable_glyphs = _pruneUnreachableGlyphs
+pruneUnusedGlyphs = _pruneUnreachableGlyphs
+prune_unused_glyphs = _pruneUnreachableGlyphs
+
+
 def normalize(value, triple, avarMapping=None):
     value = normalizeValue(value, triple)
     if avarMapping:
@@ -2791,6 +2909,10 @@ def instantiateVariableFont(
     *,
     downgradeCFF2=False,
     static=False,
+    pruneUnreachableGlyphs=False,
+    prune_unreachable_glyphs=False,
+    pruneUnusedGlyphs=False,
+    prune_unused_glyphs=False,
 ):
     """Instantiate variable font, either fully or partially.
 
@@ -2836,7 +2958,28 @@ def instantiateVariableFont(
             overlaps but CFF2 does.
         static (bool): if True, generate a full instance (static font) instead of a partial
             instance (variable font).
+        pruneUnreachableGlyphs (bool): if True, after instancing compute the glyph
+            reachability closure from the remaining cmap, GSUB/GPOS lookups,
+            composite glyph components, COLR paints/layers and other
+            glyph-referencing tables, and remove glyphs (with their per-glyph
+            records such as glyf/loca and hmtx entries) that are no longer
+            reachable, e.g. alternates referenced only by FeatureVariation
+            branches that were culled. Glyphs still referenced by surviving
+            substitutions, components or color layers are retained, the
+            relative glyph order of survivors is preserved and all glyph
+            indices are remapped by the subsetter. Defaults to False, leaving
+            the glyph set exactly as previous versions did. The snake_case
+            name ``prune_unreachable_glyphs`` and the ``pruneUnusedGlyphs`` /
+            ``prune_unused_glyphs`` aliases are accepted as well.
     """
+    pruneGlyphs = any(
+        (
+            pruneUnreachableGlyphs,
+            prune_unreachable_glyphs,
+            pruneUnusedGlyphs,
+            prune_unused_glyphs,
+        )
+    )
     # 'overlap' used to be bool and is now enum; for backward compat keep accepting bool
     overlap = OverlapMode(int(overlap))
 
@@ -3018,6 +3161,11 @@ def instantiateVariableFont(
         # name table has been updated.
         setRibbiBits(varfont)
 
+    if pruneGlyphs:
+        # Do this before the CFF2->CFF downgrade: subsetting works on CFF2 as
+        # well, and the downgrade save/reload then serializes the pruned font.
+        _pruneUnreachableGlyphs(varfont)
+
     if downgradeCFF2:
         origVarfont = varfont
         varfont = downgradeCFF2ToCFF(varfont)
@@ -3188,6 +3336,16 @@ def parseArgs(args):
         help="If all axes are pinned, downgrade CFF2 to CFF table format",
     )
     parser.add_argument(
+        "--prune-unreachable-glyphs",
+        "--prune-unused-glyphs",
+        dest="prune_unreachable_glyphs",
+        action="store_true",
+        help="After instancing, remove glyphs that are no longer referenced by "
+        "the remaining cmap, GSUB/GPOS, composite glyphs or color layers "
+        "(e.g. alternates used only by culled FeatureVariations branches). "
+        "Off by default.",
+    )
+    parser.add_argument(
         "--no-recalc-timestamp",
         dest="recalc_timestamp",
         action="store_false",
@@ -3263,6 +3421,7 @@ def main(args=None):
         updateFontNames=options.update_name_table,
         downgradeCFF2=options.downgrade_cff2,
         static=options.static,
+        pruneUnreachableGlyphs=options.prune_unreachable_glyphs,
     )
 
     suffix = "-instance" if isFullInstance else "-partial"
